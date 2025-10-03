@@ -1,0 +1,13 @@
+{
+	"folders": [
+		{
+			"name": "LumenTact",
+			"path": "."
+		},
+		{
+			"name": "coco2017",
+			"path": "../HapticFeedback/coco2017"
+		}
+	],
+	"settings": {}
+}
