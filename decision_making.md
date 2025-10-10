@@ -19,39 +19,39 @@ Decision Making is the important step between the model and the output to user. 
 ## Pseudo Code
 
 ```
-
-function decision_making(obstacle_map, free_space_map, D_thresh):
+function decisionMaking(obstacleMap, freeSpaceMap, Dthresh):
 
     # Step 1: Analyze surroundings
-    front_distance  = average_distance_in_sector(obstacle_map, "front")
-    left_distance   = average_distance_in_sector(obstacle_map, "left")
-    right_distance  = average_distance_in_sector(obstacle_map, "right")
+    frontDistance = averageDistanceInSector(obstacleMap, "front")
+    leftDistance  = averageDistanceInSector(obstacleMap, "left")
+    rightDistance = averageDistanceInSector(obstacleMap, "right")
 
     # Step 2: Decision logic
-    if front_distance < D_thresh:
-        if left_distance > right_distance and left_distance > D_thresh:
-            action = "TURN_LEFT"
-        elif right_distance > left_distance and right_distance > D_thresh:
-            action = "TURN_RIGHT"
+    if frontDistance < Dthresh:
+        if leftDistance > rightDistance and leftDistance > Dthresh:
+            action = "TURNLEFT"
+        elif rightDistance > leftDistance and rightDistance > Dthresh:
+            action = "TURNRIGHT"
         else:
             action = "STOP"
     else:
-        action = "MOVE_FORWARD"
+        action = "MOVEFORWARD"
 
     # Step 3: Output feedback
-    if action == "MOVE_FORWARD":
-        send_haptic_feedback("none")
-        play_audio("Forward")
-    elif action == "TURN_LEFT":
-        send_haptic_feedback("vibrate_left")
-        play_audio("Turn Left")
-    elif action == "TURN_RIGHT":
-        send_haptic_feedback("vibrate_right")
-        play_audio("Turn Right")
+    if action == "MOVEFORWARD":
+        sendHapticFeedback("none")
+        playAudio("Forward")
+    elif action == "TURNLEFT":
+        sendHapticFeedback("vibrateleft")
+        playAudio("Turn Left")
+    elif action == "TURNRIGHT":
+        sendHapticFeedback("vibrateright")
+        playAudio("Turn Right")
     elif action == "STOP":
-        send_haptic_feedback("strong_vibration")
-        play_audio("Stop - obstacle ahead")
+        sendHapticFeedback("strongvibration")
+        playAudio("Stop - obstacle ahead")
 
     return action
+
 
 ```
