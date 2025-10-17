@@ -1,3 +1,6 @@
 /coco2017
 /yolovenv
 /sanpo_subset_auto
+/.venv
+/dataset_yolo
+/runs
