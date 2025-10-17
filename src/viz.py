@@ -1,4 +1,5 @@
 import cv2
+import numpy as np
 
 def draw_dets(frame, dets):
     h,w = frame.shape[:2]
@@ -9,9 +10,18 @@ def draw_dets(frame, dets):
         cv2.rectangle(frame,(x1,y1),(x2,y2),(0,255,0),2)
         cv2.putText(frame, f"{d['cls']} {d['conf']:.2f}", (x1,max(0,y1-6)),
                     cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,255,0),1,cv2.LINE_AA)
-    # draw front arc
+    # front arc
     cv2.rectangle(frame,(int(0.3*w),0),(int(0.7*w),int(0.7*h)),(255,255,0),1)
     return frame
+
+def overlay_traversable(frame, trav_mask):
+    if trav_mask is None: return frame
+    overlay = frame.copy()
+    col = np.zeros_like(frame)
+    col[...,1] = 180  # green-ish
+    alpha = (trav_mask.astype(np.float32)/255.0)[...,None]*0.35
+    out = cv2.convertScaleAbs(overlay*(1-alpha) + col*alpha)
+    return out
 
 def put_hud(frame, action, fps):
     cv2.putText(frame, f"Action: {action}", (8,24),
