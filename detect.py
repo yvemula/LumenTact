@@ -1,7 +1,8 @@
 import argparse
 from ultralytics import YOLO
-
-from .haptics import generate_haptic_feedback
+from .haptics import (
+    generate_haptic_feedback,
+)
 
 
 def main():
@@ -20,7 +21,9 @@ def main():
                 cls_id = int(box.cls)
                 class_name = model.names[cls_id]
 
-                generate_haptic_feedback(class_name)
+                box_data = box.xywhn.cpu().tolist()[0]
+
+                generate_haptic_feedback(class_name, box_data)
 
 
 if __name__ == "__main__":
