@@ -23,3 +23,23 @@ model = YOLO('yolov8n.pt')
 # -------------------------------
 results = model(IMAGE_PATH)
 result = results[0]
+
+W, H = result.orig_shape[1], result.orig_shape[0]  # width, height
+
+left_dist = W
+front_dist = W
+right_dist = W
+
+for box in result.boxes:
+    cls_name = model.names[int(box.cls)]
+    if cls_name not in OBSTACLE_CLASSES:
+        continue
+    xmin, ymin, xmax, ymax = box.xyxy[0].tolist()
+    cx = (xmin + xmax) / 2
+    # Determine sector
+    if cx < W/3:
+        left_dist = min(left_dist, cx)
+    elif cx < 2*W/3:
+        front_dist = min(front_dist, cx)
+    else:
+        right_dist = min(right_dist, cx)
