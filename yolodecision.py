@@ -1,4 +1,6 @@
 from ultralytics import YOLO
+import os
+import time
 
 # -------------------------------
 # Config
@@ -11,7 +13,21 @@ D_THRESH = 50  # safe distance threshold (in pixels)
 # Mock audio/haptic functions
 # -------------------------------
 def play_audio(msg):
-    print(f"[Audio] {msg}")
+    """Plays an audio message or sound cue."""
+    # placeholder — real system could use `playsound` or `pyttsx3` for voice feedback
+    print(f"[AUDIO] {msg}")
+
+def vibrate_pattern(pattern):
+    """Simulate haptic feedback pattern."""
+    print(f"[HAPTIC] {pattern}")
+
+def visual_feedback(left, front, right, max_w):
+    """Show a simple text-based distance bar for debug."""
+    def bar(dist):
+        level = int((1 - min(dist / max_w, 1)) * 20)
+        return "█" * level + "-" * (20 - level)
+    print(f"[VISUAL] L:[{bar(left)}] F:[{bar(front)}] R:[{bar(right)}]")
+
 
 # -------------------------------
 # Load YOLO model
@@ -83,17 +99,29 @@ if front_dist < D_THRESH:
 else:
     action = "MOVE_FORWARD"
 
+
 # -------------------------------
-# Feedback
+# Feedback 
 # -------------------------------
+visual_feedback(left_dist, front_dist, right_dist, W)
+
 if action == "MOVE_FORWARD":
-    play_audio("Forward")
+    play_audio("Path clear — move forward.")
+    vibrate_pattern("pulse")
 elif action == "TURN_LEFT":
-    play_audio("Turn Left")
+    play_audio("Obstacle ahead — turn left.")
+    vibrate_pattern("vibrate-left")
 elif action == "TURN_RIGHT":
-    play_audio("Turn Right")
+    play_audio("Obstacle ahead — turn right.")
+    vibrate_pattern("vibrate-right")
 elif action == "STOP":
-    play_audio("Stop - obstacle ahead")
+    play_audio("Stop! No safe path ahead.")
+    vibrate_pattern("long-buzz")
 
 print(f"Decision: {action}")
-print(f"Distances -> Left: {left_dist:.1f}, Front: {front_dist:.1f}, Right: {right_dist:.1f}")
+print(f"Distances → Left: {left_dist:.1f}, Front: {front_dist:.1f}, Right: {right_dist:.1f}")
+
+# -------------------------------
+# show the image that we do the detection on
+# -------------------------------
+result.show()
