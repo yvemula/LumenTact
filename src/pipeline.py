@@ -1,143 +1,63 @@
 from __future__ import annotations
-import csv
-import time
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Optional, Tuple
 import cv2
+import numpy as np
+from pathlib import Path
+from typing import Iterator, Optional
+from models import MonoDepth, SanpoTraversableSeg, overlay_mask
 
-from models import SanpoTraversableSeg, MonoDepth
-from decision import decide_action
-from haptics import play
-from viz import put_hud, overlay_traversable
+def _iter_frames(src: str) -> Iterator[np.ndarray]:
+    p = Path(src)
+    if p.is_dir():
+        for f in sorted(p.glob("*.*")):
+            img = cv2.imread(str(f))
+            if img is not None:
+                yield img
+    elif p.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp"}:
+        img = cv2.imread(str(p))
+        if img is None:
+            raise RuntimeError(f"Failed to read image: {p}")
+        yield img
+    else:
+        cap = cv2.VideoCapture(str(p))
+        if not cap.isOpened():
+            raise RuntimeError(f"Failed to open video: {p}")
+        try:
+            while True:
+                ok, frame = cap.read()
+                if not ok: break
+                yield frame
+        finally:
+            cap.release()
 
-@dataclass
-class RunConfig:
-    video_path: str
-    save_out: Optional[str] = None
-    show: bool = True
-    sanpo_onnx: str = "models/sanpo_traversable.onnx"
-    use_depth: bool = True
-    log_csv: Optional[str] = "runs/last_run.csv"
-    haptic_cooldown_s: float = 0.5
-    start_paused: bool = False
+def run(source: str, out_dir: Optional[str] = None, yolo_weights: str = "yolo12n.pt",
+        yolo_seg_weights: Optional[str] = None, show: bool = False):
+    md = MonoDepth(model_type="DPT_Large")
+    seg = SanpoTraversableSeg(yolo_weights=yolo_weights, yolo_seg_weights=yolo_seg_weights)
 
-def _ensure_parent(path: Optional[str]):
-    if not path:
-        return
-    p = Path(path)
-    (p.parent if p.suffix else p).mkdir(parents=True, exist_ok=True)
+    out_path = Path(out_dir) if out_dir else None
+    if out_path: out_path.mkdir(parents=True, exist_ok=True)
 
-def run(
-    video_path: str,
-    save_out: Optional[str] = None,
-    show: bool = True,
-    sanpo_onnx: str = "models/sanpo_traversable.onnx",
-    use_depth: bool = True,
-    log_csv: Optional[str] = "runs/last_run.csv",
-    haptic_cooldown_s: float = 0.5,
-    start_paused: bool = False,
-) -> Tuple[int, float]:
+    for i, frame_bgr in enumerate(_iter_frames(source)):
+        depth01 = md(frame_bgr)
+        trav01  = seg(frame_bgr, depth01)
 
-    cfg = RunConfig(video_path, save_out, show, sanpo_onnx, use_depth, log_csv, haptic_cooldown_s, start_paused)
+        depth_vis = (depth01 * 255).astype(np.uint8)
+        depth_vis = cv2.applyColorMap(depth_vis, cv2.COLORMAP_INFERNO)
+        trav_vis  = overlay_mask(frame_bgr, trav01, alpha=0.45)
 
-    cap = cv2.VideoCapture(cfg.video_path)
-    if not cap.isOpened():
-        raise FileNotFoundError(f"Could not open video: {cfg.video_path}")
+        top = np.hstack([frame_bgr, trav_vis])
+        bot = np.hstack([
+            depth_vis,
+            cv2.cvtColor((trav01 * 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
+        ])
+        panel = np.vstack([top, bot])
 
-    writer = None
-    if cfg.save_out:
-        _ensure_parent(cfg.save_out)
-    _ensure_parent(cfg.log_csv)
-    log_fh = open(cfg.log_csv, "w", newline="") if cfg.log_csv else None
-    logger = csv.writer(log_fh) if log_fh else None
-    if logger:
-        logger.writerow(["t","frame_idx","fps","action","strength"])
+        if out_path:
+            cv2.imwrite(str(out_path / f"frame_{i:06d}.jpg"), panel)
 
-    seg = SanpoTraversableSeg(cfg.sanpo_onnx)
-    depth = MonoDepth() if cfg.use_depth else None
-
-    fps_ema, alpha = None, 0.2
-    total_frames = 0
-    t0_all = time.monotonic()
-    next_buzz_at = 0.0
-    paused = cfg.start_paused
-
-    try:
-        while True:
-            if paused and cfg.show:
-                key = cv2.waitKey(30) & 0xFF
-                if key in (ord(" "), ord("p")):
-                    paused = False
-                elif key in (27, ord("q")):
-                    break
-                continue
-
-            ok, frame = cap.read()
-            if not ok:
+        if show:
+            cv2.imshow("LumenTact — [orig | traversable] / [depth | mask]", panel)
+            if cv2.waitKey(1) & 0xFF == 27:  # ESC
                 break
-
-            t0 = time.monotonic()
-
-            # Perception
-            trav_mask = seg(frame)
-            depth_map = depth(frame) if depth else None
-
-            # Decision
-            action, strength = decide_action(
-                fps_ema or 15.0,
-                frame.shape,
-                trav_mask=trav_mask,
-                depth_map=depth_map
-            )
-
-            # Haptics (rate-limited)
-            now = time.monotonic()
-            if now >= next_buzz_at:
-                play(action, strength)
-                next_buzz_at = now + cfg.haptic_cooldown_s
-
-            # Viz
-            canvas = overlay_traversable(frame.copy(), trav_mask)
-            canvas = put_hud(canvas, action, fps_ema)
-
-            if cfg.show:
-                cv2.imshow("WearableNav (SANPO-only)", canvas)
-                key = cv2.waitKey(1) & 0xFF
-                if key in (27, ord("q")):
-                    break
-                if key in (ord(" "), ord("p")):
-                    paused = not paused
-
-            if cfg.save_out:
-                if writer is None:
-                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                    writer = cv2.VideoWriter(cfg.save_out, fourcc, 20.0, (canvas.shape[1], canvas.shape[0]))
-                writer.write(canvas)
-
-            # Timing / logs
-            dt = max(1e-4, time.monotonic() - t0)
-            inst_fps = 1.0 / dt
-            fps_ema = inst_fps if fps_ema is None else (1 - alpha) * fps_ema + alpha * inst_fps
-            total_frames += 1
-            if logger:
-                logger.writerow([f"{time.time():.3f}", total_frames, f"{fps_ema:.2f}" if fps_ema else "", action, f"{strength:.2f}"])
-
-    finally:
-        cap.release()
-        if writer:
-            writer.release()
-        if cfg.show:
-            try:
-                cv2.destroyAllWindows()
-            except:
-                pass
-        if log_fh:
-            log_fh.close()
-
-    avg_fps = total_frames / max(1e-6, (time.monotonic() - t0_all))
-    return total_frames, avg_fps
-
-# Back-compat
-def run_configured(video_path: str, save_out: Optional[str] = None, show: bool = True):
-    return run(video_path, save_out=save_out, show=show)
+    if show:
+        cv2.destroyAllWindows()
