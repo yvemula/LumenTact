@@ -3,7 +3,6 @@ import argparse, json, os, shutil, pathlib, random
 def process_subset(subset_name, img_ids, imgs, anns_by_img, cat_id_to_name, name_to_yolo, args, out_root):
     """Handles copying images and generating labels for a given subset (train/val)."""
     
-    # Define output paths using the subset name (e.g., 'images/train', 'labels/train')
     out_img_sub = os.path.join(args.img_sub_root, subset_name)
     out_lab_sub = os.path.join(args.lab_sub_root, subset_name)
     out_img = os.path.join(out_root, out_img_sub)
@@ -18,26 +17,22 @@ def process_subset(subset_name, img_ids, imgs, anns_by_img, cat_id_to_name, name
         if not os.path.exists(src):
             continue
             
-        # 1. Copy Image
         dst = os.path.join(out_img, im["file_name"])
         pathlib.Path(dst).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
 
-        # 2. Generate YOLO Labels
         W, H = im["width"], im["height"]
         lab_path = os.path.join(out_lab, pathlib.Path(im["file_name"]).with_suffix(".txt").name)
         lines = []
         for a in anns_by_img[img_id]:
-            x, y, w, h = a["bbox"]  # COCO: top-left x,y,width,height (pixels)
+            x, y, w, h = a["bbox"]  
             
-            # Convert COCO bbox to normalized YOLO format (x_center, y_center, width, height)
             xc = (x + w / 2) / W
             yc = (y + h / 2) / H
             ww = w / W
             hh = h / H
             cls = name_to_yolo[cat_id_to_name[a["category_id"]]]
             
-            # clip to [0,1] just in case
             xc = min(max(xc, 0.0), 1.0)
             yc = min(max(yc, 0.0), 1.0)
             ww = min(max(ww, 0.0), 1.0)
@@ -64,7 +59,6 @@ def main():
     ap.add_argument("--max-images", type=int, default=0, help="optional limit for a quick first run")
     args = ap.parse_args()
 
-    # --- Data Loading and Filtering ---
     keep = [s.strip() for s in args.keep.split(",") if s.strip()]
     
     with open(args.ann, "r") as f:
@@ -82,7 +76,6 @@ def main():
 
     img_ids = [i for i in imgs.keys() if i in anns_by_img]
     
-    # --- Split Data ---
     random.seed(42)
     random.shuffle(img_ids)
     
@@ -97,7 +90,6 @@ def main():
     print(f"Total relevant images: {len(img_ids)}")
     print(f"Splitting: {len(train_ids)} for training, {len(val_ids)} for validation ({args.val_split*100:.1f}%)")
 
-    # --- Process Subsets ---
     total_copied = 0
     
     print("Processing 'train' subset...")
