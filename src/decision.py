@@ -1,131 +1,127 @@
+# src/decision.py
 from __future__ import annotations
-from typing import Tuple, Optional
 import numpy as np
 import cv2
+from dataclasses import dataclass
 
-CONF_STOP = 0.65  # kept for future use if you reintroduce detectors
+@dataclass
+class Decision:
+    cmd: str                 # "STOP" | "FORWARD" | "LEFT" | "RIGHT"
+    steer: float             # -1.0 (hard left) .. +1.0 (hard right), 0 = straight
+    reason: str              # human-readable reason
+    traversable_frac: float  # fraction of traversable area used for decision
+    target_x: float | None   # 0..1 column target of traversable center in ROI
 
-def _front_arc_bbox(w: int, h: int) -> Tuple[int,int,int,int]:
-    # Center 40% width, top 70% height (used as “forward” ROI)
-    x1 = int(0.3 * w); x2 = int(0.7 * w)
-    y1 = 0;           y2 = int(0.7 * h)
-    return x1,y1,x2,y2
-
-def _estimate_step(depth: Optional[np.ndarray], trav_mask: Optional[np.ndarray]) -> Tuple[bool,bool]:
+class DecisionEngine:
     """
-    Return (step_up, step_down) using vertical depth gradients over a mid-lower ROI.
-    Positive gradient ~ step-up; negative ~ step-down.
+    Converts traversable mask + depth into simple navigation commands.
+    - Looks in a bottom ROI (walkable ground).
+    - Computes a 'target corridor' (center of mass of traversable).
+    - Issues LEFT/RIGHT if target is off-center; FORWARD if centered; STOP if blocked.
     """
-    if depth is None:
-        return False, False
-    H, W = depth.shape[:2]
-    y1, y2 = int(0.45*H), int(0.85*H)
-    x1, x2 = int(0.25*W), int(0.75*W)
-    roi = depth[y1:y2, x1:x2]
-    if roi.size == 0:
-        return False, False
-    # Vertical gradient
-    gy = cv2.Sobel(roi, cv2.CV_32F, 0, 1, ksize=3)
-    med = float(np.median(gy))
-    step_up = med > 0.12
-    step_down = med < -0.12
-    return step_up, step_down
 
-def _low_overhang_from_mask_and_depth(trav_mask: Optional[np.ndarray], depth: Optional[np.ndarray]) -> bool:
-    """
-    Heuristic: if upper band of image has very low traversability (like a solid ceiling/overhang)
-    and depth decreases upward suggesting a close occluder, signal DUCK.
-    """
-    if trav_mask is None:
-        return False
-    H, W = trav_mask.shape[:2]
-    top = trav_mask[:int(0.25*H), :]
-    # “Ceiling” if nearly no free space visible up top
-    ceiling_like = (top.mean() / 255.0) < 0.03
+    def __init__(
+        self,
+        bottom_roi_frac: float = 0.40,     # take bottom 40% of the image
+        min_trav_frac: float = 0.08,       # require at least 8% traversable in ROI
+        deadband: float = 0.10,            # +/- 10% of width counts as "centered"
+        near_depth_stop: float = 0.18,     # if depth01 is < this in center-bottom, stop
+        center_width_frac: float = 0.25,   # width of center window for near-depth check
+    ):
+        self.bottom_roi_frac = bottom_roi_frac
+        self.min_trav_frac   = min_trav_frac
+        self.deadband        = deadband
+        self.near_depth_stop = near_depth_stop
+        self.center_width_frac = center_width_frac
 
-    if depth is None:
-        return ceiling_like
+    def _bottom_roi(self, h: int) -> slice:
+        y0 = int((1.0 - self.bottom_roi_frac) * h)
+        return slice(y0, h)
 
-    # Check if top band is generally “closer” than middle band
-    mid = depth[int(0.35*H):int(0.55*H), :]
-    topd = depth[:int(0.25*H), :]
-    if topd.size and mid.size:
-        top_m = float(np.median(topd))
-        mid_m = float(np.median(mid))
-        # MiDaS is inverse-ish; still, a noticeable difference suggests nearby occluder overhead
-        close_overhead = (top_m - mid_m) > 0.08
-        return ceiling_like and close_overhead
-    return ceiling_like
+    def decide(self, mask01: np.ndarray, depth01: np.ndarray) -> Decision:
+        """
+        mask01: HxW uint8 {0,1} traversable
+        depth01: HxW float32 [0,1], larger = farther
+        """
+        h, w = mask01.shape
+        roi_y = self._bottom_roi(h)
+        roi_mask = mask01[roi_y, :]
+        roi_depth = depth01[roi_y, :]
 
-def _lane_stats(trav_mask: Optional[np.ndarray]) -> Tuple[float,float,float]:
-    """
-    Returns (left_free, center_free, right_free) as fractions [0..1] in the lower-forward region.
-    """
-    if trav_mask is None:
-        return 0.0, 0.0, 0.0
-    H, W = trav_mask.shape[:2]
-    # Focus on lower 60% as “walkable field”
-    roi = trav_mask[int(0.4*H):, :]
-    if roi.size == 0:
-        return 0.0, 0.0, 0.0
-    thirds = W // 3
-    left  = roi[:, :thirds]
-    center= roi[:, thirds:2*thirds]
-    right = roi[:, 2*thirds:]
-    return (left.mean()/255.0, center.mean()/255.0, right.mean()/255.0)
+        # 1) STOP if center-bottom is too near (step/obstacle)
+        c_w = int(self.center_width_frac * w)
+        cx0 = (w - c_w) // 2
+        cx1 = cx0 + c_w
+        center_near = float(np.nanmedian(roi_depth[:, cx0:cx1]))
+        if center_near < self.near_depth_stop:
+            return Decision(
+                cmd="STOP", steer=0.0, reason=f"near obstacle/step (depth={center_near:.2f})",
+                traversable_frac=float(roi_mask.mean()), target_x=None
+            )
 
-def decide_action(
-    fps: float,
-    frame_shape: Tuple[int,int],
-    trav_mask: Optional[np.ndarray] = None,
-    depth_map: Optional[np.ndarray] = None
-) -> Tuple[str, float]:
+        # 2) Compute traversable coverage & center-of-mass of ROI
+        trav_frac = float(roi_mask.mean())  # 0..1
+        if trav_frac < self.min_trav_frac:
+            return Decision(
+                cmd="STOP", steer=0.0, reason=f"insufficient free space ({trav_frac:.3f})",
+                traversable_frac=trav_frac, target_x=None
+            )
 
-    H, W = frame_shape[:2]
+        # Column weights: prefer deeper pixels (safer)
+        weights = roi_mask.astype(np.float32) * (roi_depth ** 1.0)
+        col_scores = weights.sum(axis=0)  # shape: (W,)
 
-    # Safety: FPS floor
-    if fps is not None and fps < 8:
-        return "STOP", 1.0
+        if col_scores.max() <= 0:
+            return Decision(
+                cmd="STOP", steer=0.0, reason="no valid traversable columns",
+                traversable_frac=trav_frac, target_x=None
+            )
 
-    # Overhang detection
-    if _low_overhang_from_mask_and_depth(trav_mask, depth_map):
-        return "DUCK", 1.0
+        # Target column = weighted centroid
+        xs = np.arange(w, dtype=np.float32)
+        target_col = float((col_scores * xs).sum() / max(1e-6, col_scores.sum()))
+        target_x01 = target_col / max(1, w - 1)
 
-    # Step up/down estimation
-    step_up, step_down = _estimate_step(depth_map, trav_mask)
-    if step_up:
-        return "STEP_UP", 0.9
-    if step_down:
-        return "STEP_DOWN", 0.9
+        # 3) Decide steering
+        offset = (target_x01 - 0.5)  # -0.5..+0.5
+        if abs(offset) <= self.deadband:
+            return Decision(
+                cmd="FORWARD",
+                steer=offset * 2.0,  # small trim
+                reason=f"corridor centered (offset={offset:+.2f})",
+                traversable_frac=trav_frac,
+                target_x=target_x01
+            )
+        elif offset > 0:
+            # steer right, normalized to [-1,+1]
+            steer = min(1.0, (offset - self.deadband) / (0.5 - self.deadband))
+            return Decision(
+                cmd="RIGHT", steer=steer,
+                reason=f"corridor right (offset={offset:+.2f})",
+                traversable_frac=trav_frac, target_x=target_x01
+            )
+        else:
+            steer = -min(1.0, (-offset - self.deadband) / (0.5 - self.deadband))
+            return Decision(
+                cmd="LEFT", steer=steer,
+                reason=f"corridor left (offset={offset:+.2f})",
+                traversable_frac=trav_frac, target_x=target_x01
+            )
 
-    # Lane free-space
-    left_f, ctr_f, right_f = _lane_stats(trav_mask)
+    # Optional: draw debug overlay with ROI and target column
+    def draw_debug(self, bgr: np.ndarray, mask01: np.ndarray, decision: Decision) -> np.ndarray:
+        out = bgr.copy()
+        h, w = mask01.shape
+        # ROI box
+        y0 = int((1 - self.bottom_roi_frac) * h)
+        cv2.rectangle(out, (0, y0), (w - 1, h - 1), (0, 255, 255), 2)
 
-    # If center is blocked or very thin, try to veer
-    thin = ctr_f < 0.10
-    very_thin = ctr_f < 0.06
+        # Target column
+        if decision.target_x is not None:
+            x = int(decision.target_x * (w - 1))
+            cv2.line(out, (x, y0), (x, h - 1), (255, 0, 255), 2)
 
-    if thin:
-        # Prefer the side with more free-space margin
-        if left_f > right_f + 0.05 and left_f > 0.12:
-            return "VEER_LEFT", 0.8 if very_thin else 0.6
-        if right_f > left_f + 0.05 and right_f > 0.12:
-            return "VEER_RIGHT", 0.8 if very_thin else 0.6
-        # If both sides are poor too, STOP
-        if max(left_f, right_f) < 0.10:
-            return "STOP", 1.0
-
-    # Global “front arc” thinness safety
-    if trav_mask is not None:
-        x1,y1,x2,y2 = _front_arc_bbox(W,H)
-        roi = trav_mask[y1:y2, x1:x2]
-        if roi.size and (roi.mean()/255.0) < 0.08:
-            return "STOP", 1.0
-
-    # Mild guidance when one side is clearly more open
-    if right_f - left_f > 0.12:
-        return "VEER_RIGHT", 0.5
-    if left_f - right_f > 0.12:
-        return "VEER_LEFT", 0.5
-
-    return "CAUTION", 0.3
+        # Command text
+        txt = f"{decision.cmd} | steer={decision.steer:+.2f} | free={decision.traversable_frac:.2f} | {decision.reason}"
+        cv2.putText(out, txt, (10, max(25, y0 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        return out
