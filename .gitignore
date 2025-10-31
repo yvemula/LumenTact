@@ -2,5 +2,6 @@
 /yolovenv
 /sanpo_subset_auto
 /.venv
+/venv
 /dataset_yolo
 /runs
