@@ -1,24 +1,26 @@
 import time
 
+CLASS_URGENCY_MAP = {
+    "person": 0.6,
+    "car": 0.6,
+    "bicycle": 0.4,
+    "traffic light": 0.4,
+    "stop sign": 0.4,
+    "bench": 0.2,
+    "DEFAULT": 0.1
+}
 
-def calculate_urgency_and_intensity(class_name, box_data):
+def _get_signal_details(class_name, box_data):
     """
-    Calculates an urgency score and corresponding haptic intensity.
-
+    Internal function to calculate urgency, intensity, and direction for a single detection.
+    
     :param class_name: The name of the detected object (e.g., 'person').
     :param box_data: The normalized bounding box data (x_center, y_center, width, height).
-                     These values are normalized to the image dimensions [0, 1].
-    :return: A tuple (urgency_score, intensity_level)
+    :return: A dictionary containing all calculated details for a single box.
     """
-    _, _, _, h = box_data
+    xc, yc, w, h = box_data
 
-    base_urgency = 0.0
-    if class_name in ["person", "car"]:
-        base_urgency = 0.6
-    elif class_name in ["bicycle", "traffic light", "stop sign"]:
-        base_urgency = 0.4
-    elif class_name in ["bench"]:
-        base_urgency = 0.2
+    base_urgency = CLASS_URGENCY_MAP.get(class_name, CLASS_URGENCY_MAP["DEFAULT"])
 
     distance_modifier = h * 0.4
     urgency_score = base_urgency + distance_modifier
@@ -34,31 +36,74 @@ def calculate_urgency_and_intensity(class_name, box_data):
     else:
         intensity_level = 5
 
-    return urgency_score, intensity_level
+    direction = "CENTER"
+    if xc < 0.33:
+        direction = "LEFT"
+    elif xc > 0.67:
+        direction = "RIGHT"
+        
+    return {
+        'class_name': class_name,
+        'box_data': box_data,
+        'urgency': urgency_score,
+        'intensity': intensity_level,
+        'direction': direction
+    }
 
 
-def generate_haptic_feedback(class_name, box_data):
+def process_frame_detections(all_detections):
     """
-    Generates a mock haptic feedback signal based on the detected object's properties.
+    Processes all detections in a single frame, selects the most critical object 
+    based on urgency score, and generates the final haptic feedback signal.
+    
+    This function prevents sensory overload by ensuring only ONE signal is generated per frame.
+
+    :param all_detections: A list of dictionaries, where each dict is 
+                           {'class_name': str, 'box_data': list [xc, yc, w, h]}.
+    :return: The generated feedback string or None.
     """
-    urgency, intensity = calculate_urgency_and_intensity(class_name, box_data)
+    if not all_detections:
+        print("[HAPTIC] Frame analysis: No objects detected. No feedback.")
+        return None
+
+    processed_detections = [_get_signal_details(d['class_name'], d['box_data']) for d in all_detections]
+
+    most_critical = max(processed_detections, key=lambda d: d['urgency'])
+
+    class_name = most_critical['class_name']
+    intensity = most_critical['intensity']
+    direction = most_critical['direction']
+    box_data = most_critical['box_data'] 
 
     signal_type = "MILD TAP"
     if intensity >= 3:
         signal_type = "STRONG VIBRATION"
     elif intensity == 2:
         signal_type = "MILD PULSE"
-
-    feedback = f"{signal_type} @ INTENSITY {intensity}"
+        
+    feedback = f"{signal_type} @ INTENSITY {intensity} - LOCATION: {direction}"
 
     print(
-        f"[HAPTIC] Detected '{class_name}' (normalized height: {box_data[3]:.2f}). Feedback: {feedback}"
+        f"[HAPTIC] Frame analysis complete. Most critical: '{class_name}' (Urgency: {most_critical['urgency']:.2f}, normalized height: {box_data[3]:.2f}, direction: {direction}). Feedback: {feedback}"
     )
 
     return feedback
 
 
 if __name__ == "__main__":
-    generate_haptic_feedback("person", (0.5, 0.5, 0.05, 0.1))
-    generate_haptic_feedback("car", (0.5, 0.9, 0.4, 0.8))
-    generate_haptic_feedback("stop sign", (0.2, 0.7, 0.2, 0.3))
+    print("--- Test Cases for Priority System ---")
+    
+    print("\nScenario 1: Close Car vs Far Person (Car wins)")
+    test_detections = [
+        {"class_name": "car", "box_data": (0.5, 0.9, 0.4, 0.8)},
+        {"class_name": "person", "box_data": (0.8, 0.7, 0.2, 0.3)},
+        {"class_name": "bench", "box_data": (0.1, 0.5, 0.1, 0.1)},
+    ]
+    process_frame_detections(test_detections)
+    
+    print("\nScenario 2: Tie-break (Closer Traffic Light wins)")
+    test_tie_break = [
+        {"class_name": "traffic light", "box_data": (0.2, 0.5, 0.1, 0.5)},
+        {"class_name": "traffic light", "box_data": (0.8, 0.8, 0.1, 0.8)},
+    ]
+    process_frame_detections(test_tie_break)
