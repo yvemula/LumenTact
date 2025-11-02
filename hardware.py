@@ -1,44 +1,62 @@
 # LumenTact/hardware.py
 import time
+import abc
+from . import config
+from .utils import setup_logger
+
+log = setup_logger(__name__)
 
 
-class HapticController:
+class BaseHapticController(abc.ABC):
     """
-    Mock Hardware Interface.
-
-    This class simulates the connection to physical haptic motors.
-    In a real implementation, this class would handle Serial, I2C, or GPIO communication.
+    Abstract Base Class for all haptic controllers.
+    Defines the standard interface for connecting, disconnecting,
+    and sending feedback.
     """
 
-    def __init__(self, num_motors=3):
-        self.num_motors = num_motors
-        self.motor_pins = {"LEFT": 0, "CENTER": 1, "RIGHT": 2}
-        print(f"[HARDWARE_MOCK] Initialized HapticController with {num_motors} motors.")
+    def __init__(self):
+        self.connected = False
+        log.info(f"Initialized {self.__class__.__name__}")
 
-    def _activate_motor(self, motor_name, intensity_level, duration_ms):
-        """Simulates activating a single motor."""
-        motor_id = self.motor_pins.get(motor_name)
-        if motor_id is None:
-            return
+    @abc.abstractmethod
+    def connect(self):
+        """Establish connection to the hardware."""
+        pass
 
-        # Convert intensity (1-5) to a voltage/PWM scale (0.0 - 1.0)
-        intensity_scale = min(max(intensity_level / 5.0, 0.0), 1.0)
+    @abc.abstractmethod
+    def disconnect(self):
+        """Safely close connection to the hardware."""
+        pass
 
-        print(f"[HARDWARE_MOCK] -> VIBRATE: Motor {motor_name} (ID: {motor_id})")
-        print(
-            f"[HARDWARE_MOCK]    -> INTENSITY: {intensity_scale * 100:.0f}% ({intensity_level}/5)"
-        )
-        print(f"[HARDWARE_MOCK]    -> DURATION: {duration_ms}ms")
-
-        # In a real app, you would start the motor, time.sleep(duration_ms / 1000.0), and stop it.
-        # time.sleep(duration_ms / 1000.0)
-
+    @abc.abstractmethod
     def send_feedback(self, signal_type, intensity, direction):
         """
         Translates a haptic signal into a specific motor command.
         """
-        duration_ms = 100  # Default duration
+        pass
 
+
+class MockController(BaseHapticController):
+    """
+    Mock Hardware Interface for development and testing.
+    Prints all haptic commands to the console instead of activating hardware.
+    """
+
+    def connect(self):
+        log.info("[MOCK_HW] Mock Haptic Controller CONNECTED.")
+        self.connected = True
+        return True
+
+    def disconnect(self):
+        log.info("[MOCK_HW] Mock Haptic Controller DISCONNECTED.")
+        self.connected = False
+
+    def send_feedback(self, signal_type, intensity, direction):
+        if not self.connected:
+            log.warn("[MOCK_HW] Cannot send feedback: Not connected.")
+            return
+
+        duration_ms = 100
         if signal_type == "STRONG VIBRATION":
             duration_ms = 300
         elif signal_type == "MILD PULSE":
@@ -46,10 +64,111 @@ class HapticController:
         elif signal_type == "MILD TAP":
             duration_ms = 50
 
-        # Send command to the correct motor
-        self._activate_motor(direction, intensity, duration_ms)
+        intensity_scale = min(max(intensity / 5.0, 0.0), 1.0)
+
+        log.info(f"[MOCK_HW] -> VIBRATE: {direction} motor")
+        log.info(f"[MOCK_HW]    -> TYPE: {signal_type}")
+        log.info(
+            f"[MOCK_HW]    -> INTENSITY: {intensity_scale * 100:.0f}% ({intensity}/5)"
+        )
+        log.info(f"[MOCK_HW]    -> DURATION: {duration_ms}ms")
 
 
-# Singleton instance to be used by other modules
-# This prevents re-initializing the "hardware" connection every time.
-GLOBAL_CONTROLLER = HapticController()
+class SerialController(BaseHapticController):
+    """
+    Hardware interface for a serial device (Arduino, ESP32, etc.).
+
+    This controller expects the serial device to understand
+    a simple command protocol, e.g., "DIRECTION,INTENSITY,DURATION\n"
+    Example: "L,5,300\n" (Left, Intensity 5, 300ms)
+    """
+
+    def __init__(self, port, baud_rate, timeout):
+        super().__init__()
+        self.port = port
+        self.baud_rate = baud_rate
+        self.timeout = timeout
+        self.serial_connection = None
+
+    def connect(self):
+        try:
+            # Dynamically import serial, so it's not a hard dependency
+            # for mock-only users.
+            import serial
+
+            self.serial_connection = serial.Serial(
+                self.port, self.baud_rate, timeout=self.timeout
+            )
+            time.sleep(2)  # Wait for serial connection to establish
+            log.info(
+                f"[SERIAL_HW] Successfully connected to {self.port} at {self.baud_rate} baud."
+            )
+            self.connected = True
+            return True
+        except ImportError:
+            log.error("[SERIAL_HW] 'pyserial' library not found.")
+            log.error("Please run 'pip install pyserial' to use the SerialController.")
+            self.connected = False
+            return False
+        except serial.SerialException as e:
+            log.error(f"[SERIAL_HW] Failed to connect to {self.port}: {e}")
+            self.connected = False
+            return False
+
+    def disconnect(self):
+        if self.serial_connection and self.serial_connection.is_open:
+            self.serial_connection.close()
+            log.info(f"[SERIAL_HW] Disconnected from {self.port}.")
+        self.connected = False
+
+    def send_feedback(self, signal_type, intensity, direction):
+        if not self.connected:
+            log.warn("[SERIAL_HW] Cannot send feedback: Not connected.")
+            return
+
+        # 1. Determine duration
+        duration_ms = 100
+        if signal_type == "STRONG VIBRATION":
+            duration_ms = 300
+        elif signal_type == "MILD PULSE":
+            duration_ms = 150
+        elif signal_type == "MILD TAP":
+            duration_ms = 50
+
+        # 2. Map direction to a command code (e.g., L, C, R)
+        dir_code = direction[0].upper()  # L, C, R
+
+        # 3. Create command string
+        #    FORMAT: "DIRECTION,INTENSITY,DURATION\n"
+        #    This is just an example; customize it to match your device's firmware.
+        command = f"{dir_code},{intensity},{duration_ms}\n"
+
+        try:
+            self.serial_connection.write(command.encode("ascii"))
+            log.debug(f"[SERIAL_HW] Sent command: {command.strip()}")
+        except Exception as e:
+            log.error(f"[SERIAL_HW] Error writing to serial port: {e}")
+            # Attempt to disconnect to prevent further errors
+            self.disconnect()
+
+
+def get_controller():
+    """
+    Factory function to get the correct hardware controller
+    based on the settings in config.py.
+    """
+    mode = config.HARDWARE_MODE.upper()
+
+    if mode == "SERIAL":
+        log.info("Hardware mode: SERIAL")
+        return SerialController(
+            port=config.SERIAL_PORT,
+            baud_rate=config.SERIAL_BAUD_RATE,
+            timeout=config.SERIAL_TIMEOUT,
+        )
+
+    if mode != "MOCK":
+        log.warn(f"Unknown HARDWARE_MODE '{config.HARDWARE_MODE}'. Defaulting to MOCK.")
+
+    log.info("Hardware mode: MOCK")
+    return MockController()
