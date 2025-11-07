@@ -11,6 +11,7 @@ class Decision:
     reason: str              # human-readable reason
     traversable_frac: float  # fraction of traversable area used for decision
     target_x: float | None   # 0..1 column target of traversable center in ROI
+    confidence: float = 1.0  # 0..1 confidence (used for haptics/failsafes)
 
 class DecisionEngine:
     """
@@ -48,15 +49,21 @@ class DecisionEngine:
         roi_mask = mask01[roi_y, :]
         roi_depth = depth01[roi_y, :]
 
+        def make_confidence(trav_frac: float, offset: float = 0.0) -> float:
+            base = min(1.0, max(0.0, (trav_frac - self.min_trav_frac) / max(1e-6, 0.5 - self.min_trav_frac)))
+            center_bonus = 1.0 - min(1.0, abs(offset) / 0.5)
+            return float(max(0.0, min(1.0, 0.5 * base + 0.5 * center_bonus)))
+
         # 1) STOP if center-bottom is too near (step/obstacle)
         c_w = int(self.center_width_frac * w)
         cx0 = (w - c_w) // 2
         cx1 = cx0 + c_w
         center_near = float(np.nanmedian(roi_depth[:, cx0:cx1]))
         if center_near < self.near_depth_stop:
+            trav_frac = float(roi_mask.mean())
             return Decision(
                 cmd="STOP", steer=0.0, reason=f"near obstacle/step (depth={center_near:.2f})",
-                traversable_frac=float(roi_mask.mean()), target_x=None
+                traversable_frac=trav_frac, target_x=None, confidence=1.0
             )
 
         # 2) Compute traversable coverage & center-of-mass of ROI
@@ -64,7 +71,7 @@ class DecisionEngine:
         if trav_frac < self.min_trav_frac:
             return Decision(
                 cmd="STOP", steer=0.0, reason=f"insufficient free space ({trav_frac:.3f})",
-                traversable_frac=trav_frac, target_x=None
+                traversable_frac=trav_frac, target_x=None, confidence=0.0
             )
 
         # Column weights: prefer deeper pixels (safer)
@@ -74,7 +81,7 @@ class DecisionEngine:
         if col_scores.max() <= 0:
             return Decision(
                 cmd="STOP", steer=0.0, reason="no valid traversable columns",
-                traversable_frac=trav_frac, target_x=None
+                traversable_frac=trav_frac, target_x=None, confidence=0.0
             )
 
         # Target column = weighted centroid
@@ -90,7 +97,8 @@ class DecisionEngine:
                 steer=offset * 2.0,  # small trim
                 reason=f"corridor centered (offset={offset:+.2f})",
                 traversable_frac=trav_frac,
-                target_x=target_x01
+                target_x=target_x01,
+                confidence=make_confidence(trav_frac, offset)
             )
         elif offset > 0:
             # steer right, normalized to [-1,+1]
@@ -98,14 +106,16 @@ class DecisionEngine:
             return Decision(
                 cmd="RIGHT", steer=steer,
                 reason=f"corridor right (offset={offset:+.2f})",
-                traversable_frac=trav_frac, target_x=target_x01
+                traversable_frac=trav_frac, target_x=target_x01,
+                confidence=make_confidence(trav_frac, offset)
             )
         else:
             steer = -min(1.0, (-offset - self.deadband) / (0.5 - self.deadband))
             return Decision(
                 cmd="LEFT", steer=steer,
                 reason=f"corridor left (offset={offset:+.2f})",
-                traversable_frac=trav_frac, target_x=target_x01
+                traversable_frac=trav_frac, target_x=target_x01,
+                confidence=make_confidence(trav_frac, offset)
             )
 
     # Optional: draw debug overlay with ROI and target column
@@ -122,6 +132,9 @@ class DecisionEngine:
             cv2.line(out, (x, y0), (x, h - 1), (255, 0, 255), 2)
 
         # Command text
-        txt = f"{decision.cmd} | steer={decision.steer:+.2f} | free={decision.traversable_frac:.2f} | {decision.reason}"
+        txt = (
+            f"{decision.cmd} | steer={decision.steer:+.2f} | "
+            f"free={decision.traversable_frac:.2f} | conf={decision.confidence:.2f} | {decision.reason}"
+        )
         cv2.putText(out, txt, (10, max(25, y0 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
         return out

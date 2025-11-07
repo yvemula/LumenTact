@@ -1,13 +1,48 @@
-from decision import decide_action
+import numpy as np
+from decision import DecisionEngine
 
-def mk(cx, conf=0.9): return {"bbox":(cx,0.5,0.2,0.4), "conf":conf, "cls":"person"}
 
-def test_stop_or_veer_on_center_threat():
-    dets = [mk(0.5, 0.9)]
-    action,_ = decide_action(dets, fps=30, frame_shape=(720,1280,3), trav_mask=None, depth_map=None)
-    assert action in ("STOP","VEER_LEFT","VEER_RIGHT")
+def make_engine(**kwargs):
+    return DecisionEngine(**kwargs)
 
-def test_veer_left_when_right_crowded():
-    dets = [mk(0.8,0.8), mk(0.75,0.7), mk(0.7,0.7)]
-    action,_ = decide_action(dets, fps=30, frame_shape=(720,1280,3), trav_mask=None, depth_map=None)
-    assert action=="VEER_LEFT"
+
+def test_stop_when_center_depth_is_near():
+    H, W = 240, 320
+    mask = np.ones((H, W), dtype=np.uint8)
+    depth = np.ones((H, W), dtype=np.float32)
+    depth[int(H * 0.8):, int(W * 0.4):int(W * 0.6)] = 0.05  # near obstacle in center-bottom
+
+    engine = make_engine(near_depth_stop=0.2)
+    decision = engine.decide(mask, depth)
+
+    assert decision.cmd == "STOP"
+    assert "near obstacle" in decision.reason
+    assert decision.confidence == 1.0
+
+
+def test_left_command_when_corridor_on_left():
+    H, W = 240, 320
+    mask = np.zeros((H, W), dtype=np.uint8)
+    mask[int(H * 0.6):, : int(W * 0.3)] = 1  # traversable only on left side
+    depth = np.ones((H, W), dtype=np.float32)
+
+    engine = make_engine(deadband=0.05)
+    decision = engine.decide(mask, depth)
+
+    assert decision.cmd == "LEFT"
+    assert decision.steer < 0
+    assert 0.0 <= decision.confidence <= 1.0
+
+
+def test_forward_when_corridor_centered():
+    H, W = 240, 320
+    mask = np.zeros((H, W), dtype=np.uint8)
+    mask[int(H * 0.6):, :] = 1  # uniform traversable floor
+    depth = np.ones((H, W), dtype=np.float32)
+
+    engine = make_engine(deadband=0.15)
+    decision = engine.decide(mask, depth)
+
+    assert decision.cmd == "FORWARD"
+    assert abs(decision.steer) <= 0.3
+    assert decision.confidence > 0.5

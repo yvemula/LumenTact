@@ -13,8 +13,8 @@ def main():
     args = ap.parse_args()
 
     keep = [s.strip() for s in args.keep.split(",") if s.strip()]
-    out_img = os.path.join(args.out, args.img-sub)
-    out_lab = os.path.join(args.out, args.lab-sub)
+    out_img = os.path.join(args.out, args.img_sub)
+    out_lab = os.path.join(args.out, args.lab_sub)
     os.makedirs(out_img, exist_ok=True)
     os.makedirs(out_lab, exist_ok=True)
 

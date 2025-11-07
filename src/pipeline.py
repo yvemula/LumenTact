@@ -4,7 +4,72 @@ import numpy as np
 from pathlib import Path
 from typing import Iterator, Optional
 from models import MonoDepth, SanpoTraversableSeg, overlay_mask
-from decision import DecisionEngine
+from decision import DecisionEngine, Decision
+
+try:
+    from haptics import play as play_haptics
+except Exception:  # pragma: no cover
+    play_haptics = None
+
+
+class SafetyMonitor:
+    """Stops the system after consecutive degraded frames (no depth or no free space)."""
+
+    def __init__(self, max_bad_frames: int = 5, min_trav_frac: float = 0.02):
+        self.max_bad_frames = max_bad_frames
+        self.min_trav_frac = min_trav_frac
+        self.bad_frame_count = 0
+
+    def guard(self, trav_mask01: Optional[np.ndarray], decision: Decision, depth_is_fallback: bool) -> Decision:
+        trav_frac = float(trav_mask01.mean()) if trav_mask01 is not None else 0.0
+        issues = []
+        if trav_mask01 is None or trav_frac < self.min_trav_frac:
+            issues.append(f"low traversable ({trav_frac:.3f})")
+        if depth_is_fallback:
+            issues.append("depth unavailable")
+
+        if not issues:
+            self.bad_frame_count = 0
+            return decision
+
+        self.bad_frame_count += 1
+        if self.bad_frame_count < self.max_bad_frames:
+            return decision
+
+        reason = " / ".join(issues)
+        return Decision(
+            cmd="STOP",
+            steer=0.0,
+            reason=f"Safety override: {reason}",
+            traversable_frac=trav_frac,
+            target_x=None,
+            confidence=0.0,
+        )
+
+
+class HapticBridge:
+    """Translates navigation decisions into belt patterns with confidence-weighted strength."""
+
+    ACTION_MAP = {
+        "STOP": "STOP",
+        "FORWARD": "CAUTION",
+        "LEFT": "VEER_LEFT",
+        "RIGHT": "VEER_RIGHT",
+    }
+
+    def __init__(self):
+        self.last_cmd: Optional[str] = None
+
+    def notify(self, decision: Decision):
+        if play_haptics is None or decision is None:
+            return
+        should_emit = (decision.cmd != self.last_cmd) or (decision.confidence < 0.5)
+        if not should_emit:
+            return
+        action = self.ACTION_MAP.get(decision.cmd, "CAUTION")
+        strength = max(0.3, min(1.0, decision.confidence))
+        play_haptics(action, strength)
+        self.last_cmd = decision.cmd
 
 def _iter_frames(src: str) -> Iterator[np.ndarray]:
     p = Path(src)
@@ -34,13 +99,29 @@ def run(source: str, out_dir: Optional[str] = None, yolo_weights: str = "yolo12n
         yolo_seg_weights: Optional[str] = None, show: bool = False):
     md = MonoDepth(model_type="DPT_Large")
     seg = SanpoTraversableSeg(yolo_weights=yolo_weights, yolo_seg_weights=yolo_seg_weights)
+    safety = getattr(run, "_safety", None)
+    if safety is None:
+        safety = SafetyMonitor()
+        run._safety = safety
+    haptics_bridge = getattr(run, "_haptics", None)
+    if haptics_bridge is None:
+        haptics_bridge = HapticBridge()
+        run._haptics = haptics_bridge
 
     out_path = Path(out_dir) if out_dir else None
     if out_path: out_path.mkdir(parents=True, exist_ok=True)
 
     for i, frame_bgr in enumerate(_iter_frames(source)):
         depth01 = md(frame_bgr)
-        trav01  = seg(frame_bgr, depth01)
+        depth_is_fallback = depth01 is None
+        if depth01 is None:
+            depth01 = np.ones(frame_bgr.shape[:2], dtype=np.float32)
+
+        trav_raw = seg(frame_bgr, depth01)
+        if trav_raw is None:
+            trav01 = np.zeros(frame_bgr.shape[:2], dtype=np.uint8)
+        else:
+            trav01 = (trav_raw > 0).astype(np.uint8)
 
         # Decision
         engine = getattr(run, "_engine", None)
@@ -49,6 +130,8 @@ def run(source: str, out_dir: Optional[str] = None, yolo_weights: str = "yolo12n
             run._engine = engine
 
         dec = engine.decide(trav01, depth01)  # NOTE: (mask, depth)
+        dec = safety.guard(trav01, dec, depth_is_fallback)
+        haptics_bridge.notify(dec)
 
         # Debug overlays
         depth_vis = (depth01 * 255).astype(np.uint8)
@@ -64,7 +147,10 @@ def run(source: str, out_dir: Optional[str] = None, yolo_weights: str = "yolo12n
         panel = np.vstack([top, bot])
 
         # Print/log the command (and optionally speak it; see TTS below)
-        print(f"[{i:06d}] CMD={dec.cmd:>7}  steer={dec.steer:+.2f}  free={dec.traversable_frac:.3f}  reason={dec.reason}")
+        print(
+            f"[{i:06d}] CMD={dec.cmd:>7}  steer={dec.steer:+.2f}  "
+            f"free={dec.traversable_frac:.3f}  conf={dec.confidence:.2f}  reason={dec.reason}"
+        )
 
         if out_path:
             cv2.imwrite(str(out_path / f"frame_{i:06d}.jpg"), panel)
