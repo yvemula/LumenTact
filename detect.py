@@ -4,6 +4,10 @@ from ultralytics import YOLO
 from .haptics import (
     process_frame_detections,
 )
+from . import hardware  # <-- IMPORT HARDWARE
+from .utils import setup_logger # <-- IMPORT LOGGER
+
+log = setup_logger(__name__)
 
 
 def main():
@@ -31,46 +35,64 @@ def main():
     )
     args = ap.parse_args()
 
-    # --- NEW SECTION: Handle camera input ---
-    # Try to convert input to an integer (for camera index)
-    # If it fails, use it as a string (for file path or RTSP stream)
+    # --- NEW: Initialize Haptic Controller ---
+    log.info("Initializing haptic controller...")
+    controller = hardware.get_controller()
+    if not controller.connect():
+        log.error("Failed to connect to haptic controller. Exiting.")
+        return
+    # --- END NEW ---
+
     try:
-        source = int(args.input)
-        print(f"[INFO] Using camera index: {source}")
-    except ValueError:
-        source = args.input
-        print(f"[INFO] Using video/image source: {source}")
-    # --- END NEW SECTION ---
+        # --- Handle camera input ---
+        try:
+            source = int(args.input)
+            log.info(f"Using camera index: {source}")
+        except ValueError:
+            source = args.input
+            log.info(f"Using video/image source: {source}")
 
-    print(f"[INFO] Loading model: {args.model}...")
-    model = YOLO(args.model)
+        log.info(f"Loading model: {args.model}...")
+        model = YOLO(args.model)
 
-    results_generator = model(
-        source,
-        stream=True,
-        show=True,  # Display the video feed
-        save=False,  # Don't save video clips by default
-        conf=args.conf,
-        iou=args.iou,
-    )
+        results_generator = model(
+            source,
+            stream=True,
+            show=True,  # Display the video feed
+            save=False,  # Don't save video clips by default
+            conf=args.conf,
+            iou=args.iou,
+        )
 
-    for r in results_generator:
-        frame_detections = []
+        for r in results_generator:
+            frame_detections = []
 
-        if r.boxes:
-            for box in r.boxes:
-                cls_id = int(box.cls)
-                class_name = model.names[cls_id]
+            if r.boxes:
+                for box in r.boxes:
+                    cls_id = int(box.cls)
+                    class_name = model.names[cls_id]
 
-                # Get normalized (x_center, y_center, width, height)
-                box_data = box.xywhn.cpu().tolist()[0]
+                    # Get normalized (x_center, y_center, width, height)
+                    box_data = box.xywhn.cpu().tolist()[0]
 
-                frame_detections.append(
-                    {"class_name": class_name, "box_data": box_data}
-                )
+                    frame_detections.append(
+                        {"class_name": class_name, "box_data": box_data}
+                    )
 
-        # Process all detections for this frame
-        process_frame_detections(frame_detections)
+            # Process all detections for this frame
+            # --- UPDATED: Pass the controller ---
+            process_frame_detections(frame_detections, controller)
+
+    except KeyboardInterrupt:
+        log.info("Detection stopped by user.")
+    except Exception as e:
+        log.error(f"An error occurred during detection: {e}")
+    finally:
+        # --- NEW: Ensure controller is disconnected ---
+        log.info("Disconnecting haptic controller.")
+        controller.disconnect()
+        log.info("Shutdown complete.")
+        # --- END NEW ---
 
 
 if __name__ == "__main__":
