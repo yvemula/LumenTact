@@ -146,11 +146,14 @@ class SanpoTraversableSeg:
         return keep.astype(np.uint8)
 
 
-def overlay_mask(bgr: np.ndarray, mask01: np.ndarray, alpha: float = 0.5) -> np.ndarray:
-    """Overlay 0/1 mask in green over BGR image."""
+def overlay_mask(bgr: np.ndarray, mask01: np.ndarray, alpha: float = 0.5, color=(0, 255, 0)) -> np.ndarray:
+    """Overlay 0/1 mask in a chosen color over the BGR image."""
     h, w = mask01.shape
-    color = np.zeros((h, w, 3), np.uint8); color[..., 1] = 255
+    color_img = np.zeros((h, w, 3), np.uint8)
+    color_img[..., 0] = color[0]
+    color_img[..., 1] = color[1]
+    color_img[..., 2] = color[2]
     mask255 = (mask01 * 255).astype(np.uint8)
-    overlay = cv2.addWeighted(bgr, 1.0, color, alpha, 0.0)
+    overlay = cv2.addWeighted(bgr, 1.0, color_img, alpha, 0.0)
     out = np.where(mask255[..., None] > 0, overlay, bgr)
     return out

@@ -2,7 +2,11 @@
 from __future__ import annotations
 import numpy as np
 import cv2
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from typing import Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from perception import SemanticInfo
 
 @dataclass
 class Decision:
@@ -12,6 +16,9 @@ class Decision:
     traversable_frac: float  # fraction of traversable area used for decision
     target_x: float | None   # 0..1 column target of traversable center in ROI
     confidence: float = 1.0  # 0..1 confidence (used for haptics/failsafes)
+    semantics: "SemanticInfo | None" = None
+    moving_obstacle_frac: float = 0.0
+    latency_ms: float = 0.0
 
 class DecisionEngine:
     """
@@ -39,7 +46,13 @@ class DecisionEngine:
         y0 = int((1.0 - self.bottom_roi_frac) * h)
         return slice(y0, h)
 
-    def decide(self, mask01: np.ndarray, depth01: np.ndarray) -> Decision:
+    def decide(
+        self,
+        mask01: np.ndarray,
+        depth01: np.ndarray,
+        semantic_info: "SemanticInfo | None" = None,
+        moving_on_path_frac: float = 0.0,
+    ) -> Decision:
         """
         mask01: HxW uint8 {0,1} traversable
         depth01: HxW float32 [0,1], larger = farther
@@ -61,17 +74,25 @@ class DecisionEngine:
         center_near = float(np.nanmedian(roi_depth[:, cx0:cx1]))
         if center_near < self.near_depth_stop:
             trav_frac = float(roi_mask.mean())
-            return Decision(
-                cmd="STOP", steer=0.0, reason=f"near obstacle/step (depth={center_near:.2f})",
-                traversable_frac=trav_frac, target_x=None, confidence=1.0
+            return self._finalize(
+                Decision(
+                    cmd="STOP", steer=0.0, reason=f"near obstacle/step (depth={center_near:.2f})",
+                    traversable_frac=trav_frac, target_x=None, confidence=1.0
+                ),
+                semantic_info,
+                moving_on_path_frac,
             )
 
         # 2) Compute traversable coverage & center-of-mass of ROI
         trav_frac = float(roi_mask.mean())  # 0..1
         if trav_frac < self.min_trav_frac:
-            return Decision(
-                cmd="STOP", steer=0.0, reason=f"insufficient free space ({trav_frac:.3f})",
-                traversable_frac=trav_frac, target_x=None, confidence=0.0
+            return self._finalize(
+                Decision(
+                    cmd="STOP", steer=0.0, reason=f"insufficient free space ({trav_frac:.3f})",
+                    traversable_frac=trav_frac, target_x=None, confidence=0.0
+                ),
+                semantic_info,
+                moving_on_path_frac,
             )
 
         # Column weights: prefer deeper pixels (safer)
@@ -79,9 +100,13 @@ class DecisionEngine:
         col_scores = weights.sum(axis=0)  # shape: (W,)
 
         if col_scores.max() <= 0:
-            return Decision(
-                cmd="STOP", steer=0.0, reason="no valid traversable columns",
-                traversable_frac=trav_frac, target_x=None, confidence=0.0
+            return self._finalize(
+                Decision(
+                    cmd="STOP", steer=0.0, reason="no valid traversable columns",
+                    traversable_frac=trav_frac, target_x=None, confidence=0.0
+                ),
+                semantic_info,
+                moving_on_path_frac,
             )
 
         # Target column = weighted centroid
@@ -92,31 +117,126 @@ class DecisionEngine:
         # 3) Decide steering
         offset = (target_x01 - 0.5)  # -0.5..+0.5
         if abs(offset) <= self.deadband:
-            return Decision(
-                cmd="FORWARD",
-                steer=offset * 2.0,  # small trim
-                reason=f"corridor centered (offset={offset:+.2f})",
-                traversable_frac=trav_frac,
-                target_x=target_x01,
-                confidence=make_confidence(trav_frac, offset)
+            return self._finalize(
+                Decision(
+                    cmd="FORWARD",
+                    steer=offset * 2.0,  # small trim
+                    reason=f"corridor centered (offset={offset:+.2f})",
+                    traversable_frac=trav_frac,
+                    target_x=target_x01,
+                    confidence=make_confidence(trav_frac, offset)
+                ),
+                semantic_info,
+                moving_on_path_frac,
             )
         elif offset > 0:
             # steer right, normalized to [-1,+1]
             steer = min(1.0, (offset - self.deadband) / (0.5 - self.deadband))
-            return Decision(
-                cmd="RIGHT", steer=steer,
-                reason=f"corridor right (offset={offset:+.2f})",
-                traversable_frac=trav_frac, target_x=target_x01,
-                confidence=make_confidence(trav_frac, offset)
+            return self._finalize(
+                Decision(
+                    cmd="RIGHT", steer=steer,
+                    reason=f"corridor right (offset={offset:+.2f})",
+                    traversable_frac=trav_frac, target_x=target_x01,
+                    confidence=make_confidence(trav_frac, offset)
+                ),
+                semantic_info,
+                moving_on_path_frac,
             )
         else:
             steer = -min(1.0, (-offset - self.deadband) / (0.5 - self.deadband))
-            return Decision(
-                cmd="LEFT", steer=steer,
-                reason=f"corridor left (offset={offset:+.2f})",
-                traversable_frac=trav_frac, target_x=target_x01,
-                confidence=make_confidence(trav_frac, offset)
+            return self._finalize(
+                Decision(
+                    cmd="LEFT", steer=steer,
+                    reason=f"corridor left (offset={offset:+.2f})",
+                    traversable_frac=trav_frac, target_x=target_x01,
+                    confidence=make_confidence(trav_frac, offset)
+                ),
+                semantic_info,
+                moving_on_path_frac,
             )
+
+    def _finalize(
+        self,
+        decision: Decision,
+        semantic_info: "SemanticInfo | None",
+        moving_on_path_frac: float,
+    ) -> Decision:
+        decision = replace(decision, moving_obstacle_frac=moving_on_path_frac)
+        if semantic_info is not None:
+            decision = replace(decision, semantics=semantic_info)
+            reason_suffix = []
+            if semantic_info.has_stairs and decision.cmd != "STOP":
+                decision = replace(
+                    decision,
+                    cmd="STOP",
+                    steer=0.0,
+                    confidence=min(decision.confidence, 0.4),
+                )
+                reason_suffix.append("stairs detected")
+            elif semantic_info.has_ramp and decision.cmd == "FORWARD":
+                decision = replace(
+                    decision,
+                    confidence=min(1.0, decision.confidence + 0.1),
+                )
+                reason_suffix.append("ramp ahead")
+            if reason_suffix:
+                decision = replace(
+                    decision,
+                    reason=f"{decision.reason} | {' & '.join(reason_suffix)}",
+                )
+        return decision
+
+
+class DecisionSmoother:
+    """Simple temporal filter to prevent command oscillations."""
+
+    def __init__(self, steer_alpha: float = 0.6, hold_frames: int = 3):
+        self.steer_alpha = np.clip(steer_alpha, 0.0, 1.0)
+        self.hold_frames = max(0, hold_frames)
+        self.prev_decision: Optional[Decision] = None
+        self._hold_counter = 0
+
+    def reset(self):
+        self.prev_decision = None
+        self._hold_counter = 0
+
+    def smooth(self, decision: Decision) -> Decision:
+        if self.prev_decision is None:
+            self.prev_decision = decision
+            self._hold_counter = 0
+            return decision
+
+        # Smooth steer and confidence
+        steer = (self.prev_decision.steer * self.steer_alpha) + (decision.steer * (1.0 - self.steer_alpha))
+        confidence = (
+            self.prev_decision.confidence * self.steer_alpha
+            + decision.confidence * (1.0 - self.steer_alpha)
+        )
+
+        cmd = decision.cmd
+        reason = decision.reason
+        if cmd != self.prev_decision.cmd and cmd != "STOP" and self.prev_decision.cmd != "STOP":
+            if self._hold_counter < self.hold_frames:
+                cmd = self.prev_decision.cmd
+                reason = f"{decision.reason} | holding {cmd.lower()} for stability"
+                self._hold_counter += 1
+            else:
+                self._hold_counter = 0
+        else:
+            self._hold_counter = 0
+
+        smoothed = replace(decision, cmd=cmd, steer=steer, confidence=confidence, reason=reason)
+        smoothed = replace(
+            smoothed,
+            traversable_frac=decision.traversable_frac,
+            target_x=decision.target_x,
+            semantics=decision.semantics,
+            moving_obstacle_frac=decision.moving_obstacle_frac,
+            latency_ms=decision.latency_ms,
+        )
+
+        self.prev_decision = smoothed
+        return smoothed
 
     # Optional: draw debug overlay with ROI and target column
     def draw_debug(self, bgr: np.ndarray, mask01: np.ndarray, decision: Decision) -> np.ndarray:

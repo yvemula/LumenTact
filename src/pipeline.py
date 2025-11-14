@@ -1,10 +1,12 @@
 from __future__ import annotations
+import time
 import cv2
 import numpy as np
 from pathlib import Path
 from typing import Iterator, Optional
 from models import MonoDepth, SanpoTraversableSeg, overlay_mask
-from decision import DecisionEngine, Decision
+from decision import DecisionEngine, Decision, DecisionSmoother
+from perception import SemanticAnalyzer, OpticalFlowTracker
 
 try:
     from haptics import play as play_haptics
@@ -71,6 +73,25 @@ class HapticBridge:
         play_haptics(action, strength)
         self.last_cmd = decision.cmd
 
+
+class LatencyWatchdog:
+    """Monitors per-frame latency and triggers a stop if it blows past the budget."""
+
+    def __init__(self, budget_ms: float = 180.0, max_breaches: int = 3):
+        self.budget_ms = budget_ms
+        self.max_breaches = max_breaches
+        self.breach_count = 0
+
+    def assess(self, latency_ms: float) -> Optional[str]:
+        if latency_ms <= self.budget_ms:
+            self.breach_count = 0
+            return None
+        self.breach_count += 1
+        if self.breach_count >= self.max_breaches:
+            self.breach_count = 0
+            return f"Latency watchdog triggered ({latency_ms:.1f}ms > {self.budget_ms:.1f}ms)"
+        return None
+
 def _iter_frames(src: str) -> Iterator[np.ndarray]:
     p = Path(src)
     if p.is_dir():
@@ -95,8 +116,14 @@ def _iter_frames(src: str) -> Iterator[np.ndarray]:
         finally:
             cap.release()
 
-def run(source: str, out_dir: Optional[str] = None, yolo_weights: str = "yolo12n.pt",
-        yolo_seg_weights: Optional[str] = None, show: bool = False):
+def run(
+    source: str,
+    out_dir: Optional[str] = None,
+    yolo_weights: str = "yolo12n.pt",
+    yolo_seg_weights: Optional[str] = None,
+    show: bool = False,
+    display_scale: float = 1.0,
+):
     md = MonoDepth(model_type="DPT_Large")
     seg = SanpoTraversableSeg(yolo_weights=yolo_weights, yolo_seg_weights=yolo_seg_weights)
     safety = getattr(run, "_safety", None)
@@ -107,11 +134,31 @@ def run(source: str, out_dir: Optional[str] = None, yolo_weights: str = "yolo12n
     if haptics_bridge is None:
         haptics_bridge = HapticBridge()
         run._haptics = haptics_bridge
+    smoother = getattr(run, "_smoother", None)
+    if smoother is None:
+        smoother = DecisionSmoother()
+        run._smoother = smoother
+    smoother.reset()
+    semantic = getattr(run, "_semantic", None)
+    if semantic is None:
+        semantic = SemanticAnalyzer()
+        run._semantic = semantic
+    flow_tracker = getattr(run, "_flow_tracker", None)
+    if flow_tracker is None:
+        flow_tracker = OpticalFlowTracker()
+        run._flow_tracker = flow_tracker
+    flow_tracker.reset()
+    latency_watchdog = getattr(run, "_watchdog", None)
+    if latency_watchdog is None:
+        latency_watchdog = LatencyWatchdog()
+        run._watchdog = latency_watchdog
+    latency_watchdog.breach_count = 0
 
     out_path = Path(out_dir) if out_dir else None
     if out_path: out_path.mkdir(parents=True, exist_ok=True)
 
     for i, frame_bgr in enumerate(_iter_frames(source)):
+        frame_start = time.perf_counter()
         depth01 = md(frame_bgr)
         depth_is_fallback = depth01 is None
         if depth01 is None:
@@ -123,14 +170,37 @@ def run(source: str, out_dir: Optional[str] = None, yolo_weights: str = "yolo12n
         else:
             trav01 = (trav_raw > 0).astype(np.uint8)
 
+        semantic_info = semantic.analyze(depth01, trav01)
+        flow_info = flow_tracker.update(frame_bgr, trav01)
+        if flow_info.moving_mask is not None:
+            trav01 = np.where(flow_info.moving_mask > 0, 0, trav01)
+
         # Decision
         engine = getattr(run, "_engine", None)
         if engine is None:
             engine = DecisionEngine()        # create once and cache on function
             run._engine = engine
 
-        dec = engine.decide(trav01, depth01)  # NOTE: (mask, depth)
+        dec = engine.decide(trav01, depth01, semantic_info, flow_info.moving_on_path_frac)
+        dec = smoother.smooth(dec)
         dec = safety.guard(trav01, dec, depth_is_fallback)
+
+        latency_ms = (time.perf_counter() - frame_start) * 1000.0
+        dec.latency_ms = latency_ms
+        watchdog_reason = latency_watchdog.assess(latency_ms)
+        if watchdog_reason and dec.cmd != "STOP":
+            dec = Decision(
+                cmd="STOP",
+                steer=0.0,
+                reason=watchdog_reason,
+                traversable_frac=dec.traversable_frac,
+                target_x=dec.target_x,
+                confidence=0.0,
+                semantics=dec.semantics,
+                moving_obstacle_frac=dec.moving_obstacle_frac,
+                latency_ms=latency_ms,
+            )
+
         haptics_bridge.notify(dec)
 
         # Debug overlays
@@ -138,6 +208,8 @@ def run(source: str, out_dir: Optional[str] = None, yolo_weights: str = "yolo12n
         depth_vis = cv2.applyColorMap(depth_vis, cv2.COLORMAP_INFERNO)
         trav_color = overlay_mask(frame_bgr, trav01, alpha=0.45)
         dec_vis = engine.draw_debug(trav_color, trav01, dec)
+        if flow_info.moving_mask is not None and np.any(flow_info.moving_mask):
+            dec_vis = overlay_mask(dec_vis, flow_info.moving_mask, alpha=0.6, color=(0, 0, 255))
 
         top = np.hstack([frame_bgr, dec_vis])
         bot = np.hstack([
@@ -147,16 +219,35 @@ def run(source: str, out_dir: Optional[str] = None, yolo_weights: str = "yolo12n
         panel = np.vstack([top, bot])
 
         # Print/log the command (and optionally speak it; see TTS below)
+        semantic_tags = []
+        if semantic_info.has_stairs:
+            semantic_tags.append("stairs")
+        if semantic_info.has_ramp:
+            semantic_tags.append("ramp")
+        motion_pct = flow_info.moving_on_path_frac * 100.0
         print(
             f"[{i:06d}] CMD={dec.cmd:>7}  steer={dec.steer:+.2f}  "
-            f"free={dec.traversable_frac:.3f}  conf={dec.confidence:.2f}  reason={dec.reason}"
+            f"free={dec.traversable_frac:.3f}  conf={dec.confidence:.2f}  "
+            f"motion={motion_pct:.2f}%  latency={dec.latency_ms:.1f}ms  "
+            f"sem={'/'.join(semantic_tags) if semantic_tags else 'none'}  reason={dec.reason}"
         )
 
         if out_path:
             cv2.imwrite(str(out_path / f"frame_{i:06d}.jpg"), panel)
 
         if show:
-            cv2.imshow("LumenTact — [orig | traversable] / [depth | mask]", panel)
+            vis = panel
+            scale = 1.0
+            if display_scale is not None:
+                try:
+                    scale = float(display_scale)
+                except (TypeError, ValueError):
+                    scale = 1.0
+                if scale <= 0:
+                    scale = 1.0
+                if scale != 1.0:
+                    vis = cv2.resize(panel, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            cv2.imshow("LumenTact [orig | traversable] / [depth | mask]", vis)
             if cv2.waitKey(1) & 0xFF == 27:  # ESC
                 break
     if show:
