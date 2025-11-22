@@ -32,6 +32,13 @@ def make_traversable_mask(h: int = 96, w: int = 96) -> np.ndarray:
     mask[int(h * 0.35) :, int(w * 0.15) : int(w * 0.85)] = 1
     return mask
 
+def jitter_frame(frame: np.ndarray, max_shift: int = 4) -> np.ndarray:
+    rng = np.random.default_rng(2)
+    dy = int(rng.integers(-max_shift, max_shift + 1))
+    dx = int(rng.integers(-max_shift, max_shift + 1))
+    m = np.float32([[1, 0, dx], [0, 1, dy]])
+    return cv2.warpAffine(frame, m, (frame.shape[1], frame.shape[0]), borderMode=cv2.BORDER_REFLECT)
+
 
 def make_scene(lighting: str, weather: str, size: tuple[int, int] = (96, 96)) -> np.ndarray:
     h, w = size
@@ -40,6 +47,8 @@ def make_scene(lighting: str, weather: str, size: tuple[int, int] = (96, 96)) ->
         "dusk": 90,
         "day": 160,
         "noon": 210,
+        "overexposed": 245,
+        "pitch_black": 5,
     }
     frame = np.full((h, w, 3), base_levels.get(lighting, 120), dtype=np.uint8)
     if weather == "rain":
@@ -87,6 +96,16 @@ def test_optical_flow_tracker_detects_motion_on_path():
     assert info.moving_on_path_frac > 0.0
 
 
+def test_decision_engine_flags_crowded_path_when_motion_is_high():
+    engine = DecisionEngine(moving_stop_threshold=0.2)
+    depth = np.ones((96, 96), dtype=np.float32)
+    mask = np.ones((96, 96), dtype=np.uint8)
+    info = SemanticAnalyzer().analyze(depth, mask)
+    decision = engine.decide(mask, depth, info, moving_on_path_frac=0.35)
+    assert decision.cmd == "STOP"
+    assert "crowded" in decision.reason
+
+
 def test_decision_smoother_reduces_oscillation():
     smoother = DecisionSmoother(steer_alpha=0.5, hold_frames=2)
     first = Decision(cmd="LEFT", steer=-0.8, reason="test", traversable_frac=0.3, target_x=0.2)
@@ -115,3 +134,33 @@ def test_synthetic_lighting_weather_variants_keep_engine_operational():
         decision = engine.decide(mask, depth, info, moving_on_path_frac=0.0)
         assert decision.cmd in {"FORWARD", "LEFT", "RIGHT", "STOP"}
         assert isinstance(frame, np.ndarray) and frame.shape[0] > 0
+
+
+def test_extreme_lighting_and_jitter_do_not_crash_pipeline_primitives():
+    analyzer = SemanticAnalyzer()
+    engine = DecisionEngine()
+    mask = make_traversable_mask()
+    settings = [
+        ("pitch_black", "fog"),
+        ("overexposed", "rain"),
+    ]
+    for lighting, weather in settings:
+        depth = make_depth_ramp()
+        frame = jitter_frame(make_scene(lighting, weather))
+        info = analyzer.analyze(depth, mask)
+        decision = engine.decide(mask, depth, info, moving_on_path_frac=0.05)
+        assert decision.cmd in {"FORWARD", "LEFT", "RIGHT", "STOP"}
+        assert frame.shape == (96, 96, 3)
+
+
+def test_semantic_analyzer_can_leverage_learned_model_predictions():
+    class DummySemanticModel:
+        def predict(self, depth, mask):
+            return {"has_stairs": True, "stairs_score": 0.9, "has_ramp": False, "ramp_score": 0.1}
+
+    analyzer = SemanticAnalyzer(semantic_model=DummySemanticModel(), blend_weight=0.8)
+    depth = make_depth_ramp()
+    mask = make_traversable_mask()
+    info = analyzer.analyze(depth, mask)
+    assert info.has_stairs
+    assert info.stairs_score >= 0.5
