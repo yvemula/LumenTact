@@ -35,12 +35,14 @@ class DecisionEngine:
         deadband: float = 0.10,            # +/- 10% of width counts as "centered"
         near_depth_stop: float = 0.18,     # if depth01 is < this in center-bottom, stop
         center_width_frac: float = 0.25,   # width of center window for near-depth check
+        moving_stop_threshold: float = 0.25,  # if moving obstacle covers >25% of path, stop
     ):
         self.bottom_roi_frac = bottom_roi_frac
         self.min_trav_frac   = min_trav_frac
         self.deadband        = deadband
         self.near_depth_stop = near_depth_stop
         self.center_width_frac = center_width_frac
+        self.moving_stop_threshold = moving_stop_threshold
 
     def _bottom_roi(self, h: int) -> slice:
         y0 = int((1.0 - self.bottom_roi_frac) * h)
@@ -184,6 +186,15 @@ class DecisionEngine:
                     decision,
                     reason=f"{decision.reason} | {' & '.join(reason_suffix)}",
                 )
+
+        if moving_on_path_frac >= self.moving_stop_threshold and decision.cmd != "STOP":
+            decision = replace(
+                decision,
+                cmd="STOP",
+                steer=0.0,
+                confidence=min(decision.confidence, 0.5),
+                reason=f"{decision.reason} | crowded scene ({moving_on_path_frac:.2f})",
+            )
         return decision
 
 

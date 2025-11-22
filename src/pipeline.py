@@ -7,6 +7,7 @@ from typing import Iterator, Optional
 from models import MonoDepth, SanpoTraversableSeg, overlay_mask
 from decision import DecisionEngine, Decision, DecisionSmoother
 from perception import SemanticAnalyzer, OpticalFlowTracker
+from telemetry import TelemetryClient
 
 try:
     from haptics import play as play_haptics
@@ -153,6 +154,10 @@ def run(
         latency_watchdog = LatencyWatchdog()
         run._watchdog = latency_watchdog
     latency_watchdog.breach_count = 0
+    telemetry = getattr(run, "_telemetry", None)
+    if telemetry is None:
+        telemetry = TelemetryClient()
+        run._telemetry = telemetry
 
     out_path = Path(out_dir) if out_dir else None
     if out_path: out_path.mkdir(parents=True, exist_ok=True)
@@ -188,6 +193,13 @@ def run(
         latency_ms = (time.perf_counter() - frame_start) * 1000.0
         dec.latency_ms = latency_ms
         watchdog_reason = latency_watchdog.assess(latency_ms)
+        if telemetry.enabled:
+            telemetry.record_latency(
+                latency_ms=latency_ms,
+                budget_ms=latency_watchdog.budget_ms,
+                breached=watchdog_reason is not None,
+                frame_index=i,
+            )
         if watchdog_reason and dec.cmd != "STOP":
             dec = Decision(
                 cmd="STOP",
