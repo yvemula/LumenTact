@@ -1,52 +1,76 @@
-# src/haptics.py
 import time
-
-class HapticsBase:
-    def send(self, action: str, strength: float = 1.0): raise NotImplementedError
-
-class NoOpHaptics(HapticsBase):
-    def send(self, action: str, strength: float = 1.0):
-        print(f"[HAPTIC] {action} ({strength:.2f})")
+import threading
+import board
+import busio
+from adafruit_drv2605 import DRV2605
 
 class DRV2605LHaptics(HapticsBase):
-    """
-    One motor per DRV2605L board. Wire ADDR pins to set unique I2C addresses if multiple.
-    """
-    def __init__(self, addresses=(0x5A,), intensity_scale=1.0):
-        import board, busio
-        from adafruit_drv2605 import DRV2605
+    def __init__(self, addresses=(0x5A,), motor_type="ERM"):
         self.i2c = busio.I2C(board.SCL, board.SDA)
-        self.ds = [DRV2605(self.i2c, address=a) for a in addresses]
-        for d in self.ds: d.use_erm = True
-        self.intensity_scale = intensity_scale
+        self.ds = []
+        
+        # Setup drivers (Assuming unique addresses or Mux handling elsewhere)
+        for addr in addresses:
+            try:
+                d = DRV2605(self.i2c, address=addr)
+                # "ERM" = Eccentric Rotating Mass (Standard vibration motor)
+                # "LRA" = Linear Resonant Actuator (Coin style, requires calibration)
+                d.use_erm = (motor_type == "ERM") 
+                self.ds.append(d)
+            except ValueError:
+                print(f"[ERROR] Haptic driver at {hex(addr)} not found.")
 
-    def _effect(self, d, effect_id, duration=0.2):
-        d.sequence[0] = (effect_id, 0)
-        d.sequence[1] = (0, 0)
-        d.play(); time.sleep(duration); d.stop()
+        self.active_thread = None
+
+    def _play_pattern(self, action):
+        """Internal method to run sequences without blocking the main thread."""
+        
+        # --- Helper for triggering a specific motor ---
+        def fire(motor_idx, effect_id, wait=0.2):
+            if motor_idx < len(self.ds):
+                d = self.ds[motor_idx]
+                d.sequence[0] = (effect_id, 0) # Set effect
+                d.sequence[1] = (0, 0)         # End sequence
+                d.play()
+                time.sleep(wait)
+                d.stop()
+
+        # --- Pattern Logic ---
+        if action == "STOP":
+            # Pulse all motors twice
+            for _ in range(2):
+                for i in range(len(self.ds)): fire(i, 47, 0) 
+                time.sleep(0.3)
+                
+        elif action == "VEER_LEFT":
+            # Fire left-most motors
+            for i in [0, 1]: fire(i, 12, 0.1)
+
+        elif action == "VEER_RIGHT":
+            # Fire right-most motors (handle variable count)
+            indices = list(range(len(self.ds)))[-2:]
+            for i in indices: fire(i, 12, 0.1)
+            
+        elif action == "STEP_UP":
+            # Ripple effect: 1 -> 2 -> 3
+            for i in range(len(self.ds)):
+                fire(i, 14, 0.1)
+
+        # Default fallback
+        else:
+            fire(0, 10, 0.15)
 
     def send(self, action: str, strength: float = 1.0):
-        # Map actions to motor indices/effects; tune for your belt layout
-        if action == "STOP":
-            for d in self.ds: self._effect(d, 47, 0.25)        # strong click all
-            time.sleep(0.1)
-            for d in self.ds: self._effect(d, 47, 0.25)
-        elif action == "VEER_LEFT":
-            for i in [0,1,2][:len(self.ds)]: self._effect(self.ds[i], 12, 0.12)
-        elif action == "VEER_RIGHT":
-            idx = list(range(len(self.ds)))[-3:] or [0]
-            for i in idx: self._effect(self.ds[i], 12, 0.12)
-        elif action == "STEP_UP":
-            for i in range(min(3,len(self.ds))):
-                self._effect(self.ds[i], 14, 0.08)
-                time.sleep(0.05)
-            self._effect(self.ds[0], 70, 0.2)
-        elif action == "STEP_DOWN":
-            self._effect(self.ds[0], 70, 0.2)
-            for i in range(min(3,len(self.ds))):
-                self._effect(self.ds[i], 14, 0.08)
-                time.sleep(0.05)
-        elif action == "DUCK":
-            for d in self.ds: self._effect(d, 70, 0.35)
-        else:  # CAUTION
-            self._effect(self.ds[0], 10, 0.12)
+        """
+        Public method: Fires the haptic pattern in a background thread.
+        This prevents the 'sleeps' from freezing your main sensor loop.
+        """
+        # If a vibration is already happening, you might want to join it or ignore new ones
+        if self.active_thread and self.active_thread.is_alive():
+             # Option A: Ignore new command until old one finishes
+             return 
+             # Option B: In a real system, you might want to kill the old thread 
+             # and start the new urgent one immediately.
+
+        self.active_thread = threading.Thread(target=self._play_pattern, args=(action,))
+        self.active_thread.start()
