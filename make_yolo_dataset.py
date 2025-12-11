@@ -1,4 +1,5 @@
-import argparse, pathlib, shutil, random, re
+import argparse, pathlib, shutil, random, re, json
+from collections import Counter, defaultdict
 import numpy as np
 from PIL import Image
 from skimage.measure import label, regionprops
@@ -42,10 +43,15 @@ def main():
     ap.add_argument("--src", default="sanpo_subset_auto", help="Root of downloaded SANPO subset")
     ap.add_argument("--out", default="dataset_yolo", help="Output YOLO dataset root")
     ap.add_argument("--ids", default="", help="Comma-separated mask IDs to keep (order defines class IDs). Empty=any nonzero → class 0")
+    ap.add_argument("--class-names", default="", help="Comma-separated class names aligned with --ids; ignored if --ids is empty")
     ap.add_argument("--val-ratio", type=float, default=0.2, help="Validation fraction (split by session)")
     ap.add_argument("--min-px", type=int, default=8, help="Drop boxes smaller than this many pixels on a side")
     ap.add_argument("--min-frac", type=float, default=0.0, help="Drop boxes smaller than this fraction of image area")
     ap.add_argument("--symlink", action="store_true", help="Symlink images instead of copying (saves disk)")
+    ap.add_argument("--write-empty-labels", action="store_true", help="Write empty label files for images with no boxes")
+    ap.add_argument("--skip-existing", action="store_true", help="Skip pairs whose output image already exists (resume runs faster)")
+    ap.add_argument("--limit-pairs", type=int, default=0, help="Optional cap on number of image/mask pairs to process (for quick tests)")
+    ap.add_argument("--sessions", default="", help="Comma-separated session folder names to include (otherwise all)")
     ap.add_argument("--seed", type=int, default=42, help="Random seed for session split")
     args = ap.parse_args()
 
@@ -59,9 +65,15 @@ def main():
     IDS = None
     if args.ids.strip():
         IDS = [int(x) for x in args.ids.split(",") if x.strip()]
+    class_names = None
+    if args.class_names.strip():
+        class_names = [x.strip() for x in args.class_names.split(",") if x.strip()]
+        if IDS is None:
+            print("Warning: --class-names ignored because --ids is empty.")
+            class_names = None
 
     IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-    MSK_EXTS = IMG_EXTS | {".npy", ".npz"}
+    VALID_EXTS = IMG_EXTS | {".npy", ".npz"}
 
     IMG_HINT = re.compile(r"(left|cam|camera|rgb|image|frame|stereo)", re.I)
     MSK_HINT = re.compile(r"(mask|seg|panoptic|semantic|label|annot|anno)", re.I)
@@ -81,6 +93,10 @@ def main():
                 # Fallback: go up two levels
                 session_dirs.add(p.parent.parent if len(parts) >= 2 else p.parent)
     session_dirs = sorted(session_dirs)
+    if args.sessions.strip():
+        wanted = {s.strip() for s in args.sessions.split(",") if s.strip()}
+        session_dirs = [s for s in session_dirs if s.name in wanted]
+    print(f"Discovered {len(session_dirs)} session directories (after filtering).")
 
     # -----------------------------------
     # Build image↔mask pairs per session
@@ -93,14 +109,37 @@ def main():
         for f in sess.rglob("*"):
             if f.is_file():
                 suf = f.suffix.lower()
-                if suf in IMG_EXTS:
-                    stem = f.stem
+                if suf not in VALID_EXTS:
+                    continue
+                path_str = str(f)
+                mask_hint = bool(MSK_HINT.search(path_str))
+                img_hint = bool(IMG_HINT.search(path_str))
+
+                role = None
+                if suf in {".npy", ".npz"}:
+                    role = "mask"
+                elif mask_hint and not img_hint:
+                    role = "mask"
+                elif img_hint and not mask_hint:
+                    role = "img"
+                elif mask_hint and img_hint:
+                    role = "mask"  # prefer mask on ambiguous hints
+                else:
+                    parent = f.parent.name.lower()
+                    if parent in {"masks", "mask", "labels", "label", "annotations", "annos", "seg", "semantic", "panoptic"}:
+                        role = "mask"
+                    elif parent in {"images", "imgs", "rgb", "frames", "camera", "cam"}:
+                        role = "img"
+                    else:
+                        role = "img" if suf in IMG_EXTS else "mask"
+
+                stem = f.stem
+                if role == "img":
                     img_map[stem] = f
-                    img_score[stem] = 1 + (1 if IMG_HINT.search(str(f)) else 0)
-                elif suf in MSK_EXTS:
-                    stem = f.stem
+                    img_score[stem] = 1 + (1 if img_hint else 0)
+                else:
                     msk_map[stem] = f
-                    msk_score[stem] = 1 + (1 if MSK_HINT.search(str(f)) else 0)
+                    msk_score[stem] = 1 + (1 if mask_hint else 0)
 
         shared = sorted(set(img_map) & set(msk_map))
         for stem in shared:
@@ -109,6 +148,14 @@ def main():
 
     # Prefer likely-good folders (left/seg)
     pairs.sort(key=lambda x: x[3], reverse=True)
+
+    if args.limit_pairs > 0:
+        pairs = pairs[: args.limit_pairs]
+        print(f"Limiting to first {len(pairs)} pairs (--limit-pairs).")
+
+    if not pairs:
+        print("No image/mask pairs found after filtering. Nothing to do.")
+        return
 
     # -----------------------------------
     # Session-level split
@@ -122,10 +169,29 @@ def main():
     # Convert
     # -----------------------------------
     n_empty = 0
+    empty_written = 0
     total_pairs = 0
-    for sess, img_p, msk_p, _score in tqdm(pairs, desc="Converting"):
+    total_boxes = 0
+    shape_mismatch = 0
+    dropped_min_px = 0
+    dropped_min_frac = 0
+    skipped_existing = 0
+    class_box_counts = Counter()
+    split_img_counts = Counter()
+    print(f"Starting conversion of {len(pairs)} pairs across {len(sess_list)} sessions...")
+    for sess, img_p, msk_p, _score in tqdm(pairs, desc="Converting", mininterval=0.2):
         # Determine split
         split = "train" if sess in train_sessions else "val"
+
+        # Build unique output names (avoid collisions across sessions)
+        skey = session_key(sess, SRC)
+        stem = f"{skey}__{img_p.stem}"
+        out_img = OUT / f"images/{split}/{stem}{img_p.suffix.lower()}"
+        out_lbl = OUT / f"labels/{split}/{stem}.txt"
+
+        if args.skip_existing and out_img.exists():
+            skipped_existing += 1
+            continue
 
         # Load image
         try:
@@ -138,6 +204,15 @@ def main():
         try:
             arr = load_mask(msk_p)
         except Exception:
+            continue
+
+        # Shape validation
+        if arr.ndim < 2:
+            shape_mismatch += 1
+            continue
+        mH, mW = arr.shape[:2]
+        if mW != W or mH != H:
+            shape_mismatch += 1
             continue
 
         # Candidate class IDs present in this mask
@@ -155,8 +230,10 @@ def main():
                 wpx, hpx = (xmax - xmin), (ymax - ymin)
                 # size thresholds
                 if wpx < args.min_px or hpx < args.min_px:
+                    dropped_min_px += 1
                     continue
                 if args.min_frac and (wpx * hpx) < args.min_frac * (W * H):
+                    dropped_min_frac += 1
                     continue
                 cx, cy, w, h = norm_box(xmin, ymin, xmax, ymax, W, H)
                 # class index
@@ -167,11 +244,11 @@ def main():
                     cls = IDS.index(int(mid))
                 boxes.append((cls, cx, cy, w, h))
 
-        # Build unique output names (avoid collisions across sessions)
-        skey = session_key(sess, SRC)
-        stem = f"{skey}__{img_p.stem}"
-        out_img = OUT / f"images/{split}/{stem}{img_p.suffix.lower()}"
-        out_lbl = OUT / f"labels/{split}/{stem}.txt"
+        if boxes:
+            for c, *_ in boxes:
+                class_box_counts[c] += 1
+                total_boxes += 1
+
         out_img.parent.mkdir(parents=True, exist_ok=True)
         out_lbl.parent.mkdir(parents=True, exist_ok=True)
 
@@ -182,6 +259,7 @@ def main():
             out_img.symlink_to(img_p.resolve())
         else:
             shutil.copy2(img_p, out_img)
+        split_img_counts[split] += 1
 
         # Write labels only if we have boxes
         if boxes:
@@ -190,16 +268,51 @@ def main():
                     f.write(f"{c} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}\n")
         else:
             n_empty += 1
+            if args.write_empty_labels:
+                out_lbl.touch()
+                empty_written += 1
             # intentionally no empty txt file (Ultralytics treats missing label as background)
 
         total_pairs += 1
 
-    print(f"Done. Sessions: {len(sess_list)}  Pairs processed: {total_pairs}  Empty-label images: {n_empty}")
+    if IDS is None:
+        names = ["obstacle"]
+    else:
+        if class_names and len(class_names) != len(IDS):
+            print("Warning: --class-names count does not match --ids; falling back to mask IDs as names.")
+            class_names = None
+        names = class_names if class_names else [str(mid) for mid in IDS]
+
+    data_yaml = OUT / "data.yaml"
+    data_yaml.write_text(
+        f"train: {str((OUT / 'images/train').resolve())}\n"
+        f"val: {str((OUT / 'images/val').resolve())}\n"
+        f"nc: {len(names)}\n"
+        f"names: {json.dumps(names)}\n"
+    )
+
+    print(f"Done. Sessions discovered: {len(sess_list)}  Pairs converted: {total_pairs}")
+    if shape_mismatch:
+        print(f"Skipped pairs due to image/mask shape mismatch: {shape_mismatch}")
+    print(f"Split images: train={split_img_counts.get('train', 0)}  val={split_img_counts.get('val', 0)}")
+    print(f"Boxes kept: {total_boxes}  |  Dropped (min_px): {dropped_min_px}  Dropped (min_frac): {dropped_min_frac}")
+    if args.skip_existing:
+        print(f"Skipped existing outputs: {skipped_existing}")
+    if args.write_empty_labels:
+        print(f"Empty-label images: {n_empty} (empty label files written: {empty_written})")
+    else:
+        print(f"Empty-label images: {n_empty} (labels intentionally omitted)")
+    if class_box_counts:
+        readable_counts = {names[c] if c < len(names) else f'class_{c}': n for c, n in sorted(class_box_counts.items())}
+        print(f"Boxes by class: {readable_counts}")
     print(f"Output: {OUT}/images/{{train,val}}  and  {OUT}/labels/{{train,val}}")
+    print(f"Wrote YOLO data config: {data_yaml}")
     if IDS is None:
         print("Class mapping: single-class (0=obstacle, any nonzero mask)")
     else:
         print(f"Class mapping (index → mask id): { {i: mid for i, mid in enumerate(IDS)} }")
+        if class_names:
+            print(f"Class names (index → name): { {i: name for i, name in enumerate(names)} }")
         print("Make sure your lumendata.yaml `names:[...]` matches this order.")
         
 if __name__ == "__main__":

@@ -4,4 +4,6 @@
 /.venv
 /venv
 /dataset_yolo
+/dataset_yolo_train
+/dataset_yolo_test
 /runs
