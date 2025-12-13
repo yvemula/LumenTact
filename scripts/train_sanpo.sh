@@ -19,6 +19,8 @@ DEVICE=${DEVICE:-0}
 VAL_RATIO=${VAL_RATIO:-0.2}
 VENV_BIN=${VENV_BIN:-./venv/bin}
 EXPORT_FORMATS=${EXPORT_FORMATS:-"onnx"}
+TEACHER_WEIGHTS=${TEACHER_WEIGHTS:-}
+PSEUDO_OUT=${PSEUDO_OUT:-"${OUT}_pseudo"}
 
 build_dataset() {
   echo "==> Building dataset at '$OUT' from '$SRC' (skip existing outputs)..."
@@ -33,15 +35,15 @@ build_dataset() {
 }
 
 ensure_data_yaml() {
-  echo "==> Ensuring data.yaml exists for '$OUT'..."
-  "$VENV_BIN/python" tools/ensure_data_yaml.py --data "$OUT" || true
+  echo "==> Ensuring data.yaml exists for '$1'..."
+  "$VENV_BIN/python" tools/ensure_data_yaml.py --data "$1" || true
 }
 
 train_model() {
   echo "==> Training model '$MODEL' -> run name '$NAME'..."
   "$VENV_BIN/yolo" train \
     model="$MODEL" \
-    data="$OUT/data.yaml" \
+    data="$TRAIN_ROOT/data.yaml" \
     epochs="$EPOCHS" \
     imgsz="$IMGSZ" \
     batch="$BATCH" \
@@ -55,7 +57,7 @@ validate_best() {
     echo "==> Validating best checkpoint: $best"
     "$VENV_BIN/yolo" val \
       model="$best" \
-      data="$OUT/data.yaml" \
+      data="$TRAIN_ROOT/data.yaml" \
       batch="$BATCH" \
       device="$DEVICE" \
       name="${NAME}_val" || true
@@ -66,7 +68,7 @@ validate_best() {
 
 run_predict() {
   local best="runs/detect/$NAME/weights/best.pt"
-  local predict_src=${PREDICT_SOURCE:-"$OUT/images/val"}
+  local predict_src=${PREDICT_SOURCE:-"$TRAIN_ROOT/images/val"}
   local predict_out=${PREDICT_OUT:-"runs/predict_sanpo"}
   local predict_name=${PREDICT_NAME:-"$NAME"}
   if [[ -f "$best" ]]; then
@@ -103,7 +105,7 @@ export_formats() {
 
 benchmark_model() {
   local best="runs/detect/$NAME/weights/best.pt"
-  local bench_src=${BENCHMARK_SOURCE:-"$OUT/images/val"}
+  local bench_src=${BENCHMARK_SOURCE:-"$TRAIN_ROOT/images/val"}
   if [[ -f "$best" ]]; then
     echo "==> Benchmarking throughput on ${bench_src} ..."
     "$VENV_BIN/python" tools/benchmark_inference.py \
@@ -120,7 +122,24 @@ benchmark_model() {
 }
 
 build_dataset
-ensure_data_yaml
+TRAIN_ROOT="$OUT"
+if [[ -n "$TEACHER_WEIGHTS" ]]; then
+  echo "==> Generating pseudo-label dataset using teacher: $TEACHER_WEIGHTS"
+  "$VENV_BIN/python" tools/pseudo_labels.py \
+    --teacher "$TEACHER_WEIGHTS" \
+    --data "$OUT" \
+    --out "$PSEUDO_OUT" \
+    --imgsz "$IMGSZ" \
+    --conf "${PSEUDO_CONF:-0.25}" \
+    --device "$DEVICE" \
+    --symlink \
+    --splits "${PSEUDO_SPLITS:-train}" \
+    --max "${PSEUDO_MAX:-0}" \
+    --overwrite-labels
+  TRAIN_ROOT="$PSEUDO_OUT"
+fi
+
+ensure_data_yaml "$TRAIN_ROOT"
 train_model
 validate_best
 run_predict
