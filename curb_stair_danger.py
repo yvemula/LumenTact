@@ -1,10 +1,11 @@
 """
-LumenTact – Core Vision Pipeline
-Implements ROI-based edge detection and Hough line analysis.
+LumenTact – Hazard Detection Core
+Adds stair and curb reasoning with confidence smoothing.
 """
 
 import cv2
 import numpy as np
+from collections import deque
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -22,79 +23,116 @@ HOUGH_MAX_LINE_GAP = 10
 ROI_TOP_RATIO = 0.4
 ROI_BOTTOM_RATIO = 1.0
 
+STAIR_SPACING = 30
+CURB_HEIGHT = 20
+HISTORY_SIZE = 10
+
 # -------------------------------
-# Line Geometry Utilities
+# Detection History
 # -------------------------------
-def calculate_angle(x1, y1, x2, y2):
-    dx, dy = x2 - x1, y2 - y1
-    return abs(np.degrees(np.arctan2(dy, dx)))
+class DetectionHistory:
+    def __init__(self):
+        self.stairs = deque(maxlen=HISTORY_SIZE)
+        self.curbs = deque(maxlen=HISTORY_SIZE)
 
-def is_horizontal(x1, y1, x2, y2, thresh=15):
-    angle = calculate_angle(x1, y1, x2, y2)
-    return angle < thresh or angle > 180 - thresh
+    def update(self, stairs, curbs):
+        self.stairs.append(int(stairs))
+        self.curbs.append(int(curbs))
 
-def is_vertical(x1, y1, x2, y2, thresh=75):
-    angle = calculate_angle(x1, y1, x2, y2)
-    return thresh < angle < (180 - thresh)
+    def stair_conf(self):
+        return sum(self.stairs) / len(self.stairs) if self.stairs else 0
 
-def merge_lines(lines, dist_thresh=20):
-    if not lines:
-        return []
+    def curb_conf(self):
+        return sum(self.curbs) / len(self.curbs) if self.curbs else 0
 
-    merged = []
+# -------------------------------
+# Geometry
+# -------------------------------
+def angle(x1, y1, x2, y2):
+    return abs(np.degrees(np.arctan2(y2 - y1, x2 - x1)))
+
+def is_horizontal(x1, y1, x2, y2):
+    a = angle(x1, y1, x2, y2)
+    return a < 15 or a > 165
+
+# -------------------------------
+# Hazard Detection
+# -------------------------------
+def detect_stairs(lines):
+    horizontals = [l for l in lines if is_horizontal(*l)]
+    horizontals.sort(key=lambda l: (l[1] + l[3]) / 2)
+
+    groups, group = [], []
+    for line in horizontals:
+        if not group:
+            group.append(line)
+            continue
+
+        prev_y = (group[-1][1] + group[-1][3]) / 2
+        curr_y = (line[1] + line[3]) / 2
+
+        if abs(curr_y - prev_y) < STAIR_SPACING * 1.5:
+            group.append(line)
+        else:
+            if len(group) >= 3:
+                groups.append(group)
+            group = [line]
+
+    if len(group) >= 3:
+        groups.append(group)
+
+    return groups
+
+def detect_curbs(edges, lines):
+    curbs = []
     for x1, y1, x2, y2 in lines:
-        merged.append([x1, y1, x2, y2])
-    return merged
-
-# -------------------------------
-# Frame Processing
-# -------------------------------
-def process_frame(frame):
-    h, w = frame.shape[:2]
-    roi_y1 = int(h * ROI_TOP_RATIO)
-    roi_y2 = int(h * ROI_BOTTOM_RATIO)
-
-    roi = frame[roi_y1:roi_y2, :]
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (BLUR_KERNEL, BLUR_KERNEL), 0)
-    edges = cv2.Canny(blurred, CANNY_LOW, CANNY_HIGH)
-
-    lines_raw = cv2.HoughLinesP(
-        edges, 1, np.pi / 180,
-        HOUGH_THRESHOLD,
-        minLineLength=HOUGH_MIN_LINE_LENGTH,
-        maxLineGap=HOUGH_MAX_LINE_GAP
-    )
-
-    lines = []
-    if lines_raw is not None:
-        for l in lines_raw:
-            x1, y1, x2, y2 = l[0]
-            lines.append([x1, y1 + roi_y1, x2, y2 + roi_y1])
-
-    return edges, merge_lines(lines), (0, roi_y1, w, roi_y2)
+        if is_horizontal(x1, y1, x2, y2):
+            band = edges[int(y1):int(y1 + CURB_HEIGHT), int(x1):int(x2)]
+            if band.size > 0 and np.sum(band) > CURB_HEIGHT * 50:
+                curbs.append((x1, y1, x2, y2))
+    return curbs
 
 # -------------------------------
 # Main
 # -------------------------------
 def main():
     cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        raise RuntimeError("Camera not available")
+    history = DetectionHistory()
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        edges, lines, roi = process_frame(frame)
-        display = frame.copy()
+        h = frame.shape[0]
+        roi_y1 = int(h * ROI_TOP_RATIO)
+        roi = frame[roi_y1:, :]
 
-        for x1, y1, x2, y2 in lines:
-            cv2.line(display, (x1, y1), (x2, y2), (0, 255, 0), 1)
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, CANNY_LOW, CANNY_HIGH)
 
-        cv2.imshow("Core Vision Pipeline", display)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        raw = cv2.HoughLinesP(edges, 1, np.pi / 180, HOUGH_THRESHOLD,
+                              minLineLength=HOUGH_MIN_LINE_LENGTH,
+                              maxLineGap=HOUGH_MAX_LINE_GAP)
+
+        lines = []
+        if raw is not None:
+            for l in raw:
+                x1, y1, x2, y2 = l[0]
+                lines.append([x1, y1 + roi_y1, x2, y2 + roi_y1])
+
+        stairs = detect_stairs(lines)
+        curbs = detect_curbs(edges, lines)
+        history.update(bool(stairs), bool(curbs))
+
+        output = frame.copy()
+        cv2.putText(output, f"Stair confidence: {history.stair_conf():.2f}",
+                    (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(output, f"Curb confidence: {history.curb_conf():.2f}",
+                    (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+        cv2.imshow("LumenTact – Hazard Core", output)
+        if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 
     cap.release()
