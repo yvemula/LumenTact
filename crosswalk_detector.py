@@ -36,7 +36,7 @@ class TrafficLightState(Enum):
     YELLOW = "YELLOW"
     GREEN = "GREEN"
     UNKNOWN = "UNKNOWN"
-    
+
 # -------------------------------
 # Traffic Light Analyzer
 # -------------------------------
@@ -226,27 +226,106 @@ class CrosswalkDetector:
     def get_detection_confidence(self):
         return sum(self.detection_history)/len(self.detection_history) if self.detection_history else 0.0
 
+# -------------------------------
+# Visualization
+# -------------------------------
+def draw_crosswalk(frame, crosswalk, show_stripes=True):
+    x1,y1,x2,y2 = map(int,crosswalk['bbox'])
+    cv2.rectangle(frame,(x1,y1),(x2,y2),(0,255,0),3)
+    if show_stripes:
+        for s in crosswalk['stripes']:
+            cv2.line(frame,(s['x_start'],s['y']),(s['x_end'],s['y']),(255,0,255),2)
+    label=f"CROSSWALK ({crosswalk['count']} stripes) {crosswalk['confidence']:.2f}"
+    cv2.putText(frame,label,(x1,y1-10),cv2.FONT_HERSHEY_SIMPLEX,0.7,(0,255,0),2)
 
+def draw_traffic_light(frame, light):
+    x1,y1,x2,y2 = light['bbox']
+    state = light['state']
+    color = {(TrafficLightState.RED):(0,0,255),
+             (TrafficLightState.YELLOW):(0,255,255),
+             (TrafficLightState.GREEN):(0,255,0)}.get(state,(128,128,128))
+    cv2.rectangle(frame,(x1,y1),(x2,y2),color,3)
+    label = f"{state.value}"
+    label_size,_ = cv2.getTextSize(label,cv2.FONT_HERSHEY_SIMPLEX,0.8,2)
+    cv2.rectangle(frame,(x1,y1-label_size[1]-10),(x1+label_size[0],y1),color,-1)
+    cv2.putText(frame,label,(x1,y1-5),cv2.FONT_HERSHEY_SIMPLEX,0.8,(255,255,255),2)
 
+def draw_safety_status(frame,status,color):
+    h,w = frame.shape[:2]
+    cv2.rectangle(frame,(w//2-250,h-80),(w//2+250,h-20),(0,0,0),-1)
+    cv2.rectangle(frame,(w//2-250,h-80),(w//2+250,h-20),color,3)
+    cv2.putText(frame,status.replace('_',' '),(w//2-200,h-40),cv2.FONT_HERSHEY_SIMPLEX,1.0,color,3)
+
+def draw_roi_zones(frame):
+    h,w = frame.shape[:2]
+    cv2.rectangle(frame,(0,int(h*CROSSWALK_ROI_TOP)),(w,int(h*CROSSWALK_ROI_BOTTOM)),(0,255,0),2)
+    cv2.line(frame,(0,int(h*TRAFFIC_LIGHT_ROI_TOP)),(w,int(h*TRAFFIC_LIGHT_ROI_TOP)),(255,0,0),2)
+
+# -------------------------------
+# Main loop
+# -------------------------------
 def main():
+    print("[INFO] Loading YOLO model...")
+    yolo = YOLO(YOLO_MODEL_PATH)
     cap = cv2.VideoCapture(0)
-    detector = CrosswalkDetector()
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT,480)
+
+    crosswalk_detector = CrosswalkDetector()
+    traffic_analyzer = TrafficLightAnalyzer()
+    safety_monitor = CrossingSafetyMonitor()
+
+    show_stripes, show_roi = SHOW_STRIPES, SHOW_ROI
+    prev_time = time.time()
 
     while True:
         ret, frame = cap.read()
-        if not ret:
-            break
+        if not ret: break
 
-        h, _ = frame.shape[:2]
-        roi = frame[int(h * CROSSWALK_ROI_TOP):int(h * CROSSWALK_ROI_BOTTOM), :]
-        binary = detector.detect_white_stripes(roi)
+        # YOLO detections
+        results = yolo(frame, conf=CONFIDENCE_THRESHOLD, verbose=False)
+        detections = [((int(b.xyxy[0][0]),int(b.xyxy[0][1]),int(b.xyxy[0][2]),int(b.xyxy[0][3])),
+                       yolo.names[int(b.cls[0])],float(b.conf[0])) for b in results[0].boxes]
 
-        cv2.imshow("Stripe Binary", binary)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+        # Crosswalk
+        crosswalk, _ = crosswalk_detector.detect_crosswalk(frame)
+        conf = crosswalk_detector.get_detection_confidence()
+
+        # Traffic lights
+        lights = traffic_analyzer.analyze_traffic_lights(frame,detections)
+        dominant = traffic_analyzer.get_dominant_state(lights)
+        traffic_analyzer.update_history(dominant)
+        stable = traffic_analyzer.get_stable_state()
+
+        # Safety
+        dist = frame.shape[0]-crosswalk['bbox'][3] if crosswalk else float('inf')
+        status,color = safety_monitor.assess_crossing_safety(crosswalk is not None, stable, dist)
+
+        output = frame.copy()
+        if show_roi: draw_roi_zones(output)
+        if crosswalk: draw_crosswalk(output,crosswalk,show_stripes)
+        for l in lights: draw_traffic_light(output,l)
+        draw_safety_status(output,status,color)
+
+        # FPS
+        curr_time = time.time()
+        fps = 1/(curr_time-prev_time) if curr_time>prev_time else 0
+        prev_time=curr_time
+        cv2.putText(output,f"FPS: {fps:.1f}",(20,30),cv2.FONT_HERSHEY_SIMPLEX,0.6,(255,255,255),2)
+
+        cv2.imshow("LumenTact - Crosswalk Detector",output)
+        key = cv2.waitKey(1) & 0xFF
+        if key==ord('q'): break
+        elif key==ord('s'): show_stripes = not show_stripes
+        elif key==ord('r'): show_roi = not show_roi
 
     cap.release()
     cv2.destroyAllWindows()
+    print("[INFO] Crosswalk detection terminated.")
+
+if __name__ == "__main__":
+    main()
+
 
 
 if __name__ == "__main__":
