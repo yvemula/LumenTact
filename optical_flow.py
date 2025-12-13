@@ -8,6 +8,7 @@ import numpy as np
 import time
 from collections import deque
 import warnings
+from collections import deque
 warnings.filterwarnings('ignore')
 
 # -------------------------------
@@ -117,13 +118,52 @@ def visualize_flow_vectors(frame, flow):
                 (0, 255, 0), 1
             )
 
+
+
 # -------------------------------
-# Main Loop
+# Ego-Motion Estimator
 # -------------------------------
+class EgoMotionEstimator:
+    def __init__(self):
+        self.history = deque(maxlen=10)
+
+    def estimate(self, flow):
+        vectors = flow.reshape(-1, 2)
+        mags = np.linalg.norm(vectors, axis=1)
+        valid = vectors[mags > 0.5]
+
+        if len(valid) < 10:
+            return np.array([0.0, 0.0])
+
+        ego = np.median(valid, axis=0)
+        self.history.append(ego)
+        return ego
+
+    def smooth(self):
+        if not self.history:
+            return np.array([0.0, 0.0])
+        return np.mean(self.history, axis=0)
+
+    def compensate(self, flow, ego):
+        compensated = flow.copy()
+        compensated[..., 0] -= ego[0]
+        compensated[..., 1] -= ego[1]
+        return compensated
+
+
 def main():
     cap = cv2.VideoCapture(0)
-    flow_comp = OpticalFlowComputer()
+    if not cap.isOpened():
+        raise RuntimeError("Cannot open webcam")
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+    flow_computer = OpticalFlowComputer(FLOW_METHOD)
     region_analyzer = MotionRegionAnalyzer(REGION_GRID_SIZE)
+    ego_estimator = EgoMotionEstimator()
+
+    prev_time = time.time()
 
     while True:
         ret, frame = cap.read()
@@ -131,20 +171,48 @@ def main():
             break
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        flow = flow_comp.compute_flow(gray)
+
+        # --- Optical flow ---
+        flow = flow_computer.compute_flow(gray)
 
         output = frame.copy()
-        if flow is not None:
-            mag = flow_comp.get_flow_magnitude(flow)
-            region_analyzer.analyze_regions(mag, frame.shape)
-            visualize_flow_vectors(output, flow)
 
-        cv2.imshow("Optical Flow Regions", output)
+        if flow is not None:
+            # --- Ego-motion estimation ---
+            ego_motion = ego_estimator.estimate(flow)
+            ego_smoothed = ego_estimator.smooth()
+
+            # --- Compensate flow ---
+            flow_compensated = ego_estimator.compensate(flow, ego_smoothed)
+
+            # --- Magnitude + region analysis ---
+            mag = flow_computer.get_flow_magnitude(flow_compensated)
+            motion_grid, motion_types = region_analyzer.analyze_regions(
+                mag, frame.shape
+            )
+            region_analyzer.update_history(motion_grid)
+
+            # --- Visualization ---
+            visualize_flow_vectors(output, flow_compensated)
+
+        # --- FPS ---
+        curr_time = time.time()
+        fps = 1.0 / (curr_time - prev_time) if curr_time > prev_time else 0
+        prev_time = curr_time
+
+        cv2.putText(
+            output, f"FPS: {fps:.1f}", (20, 30),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2
+        )
+
+        cv2.imshow("LumenTact - Optical Flow (Ego Compensated)", output)
+
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
     cap.release()
     cv2.destroyAllWindows()
+
 
 if __name__ == "__main__":
     main()
