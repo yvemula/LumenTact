@@ -36,6 +36,55 @@ class TrafficLightState(Enum):
     YELLOW = "YELLOW"
     GREEN = "GREEN"
     UNKNOWN = "UNKNOWN"
+    
+# -------------------------------
+# Traffic Light Analyzer
+# -------------------------------
+class TrafficLightAnalyzer:
+    def __init__(self):
+        self.light_history = deque(maxlen=LIGHT_STATE_HISTORY)
+
+    def detect_light_color(self, roi):
+        if roi.size == 0:
+            return TrafficLightState.UNKNOWN
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        red_mask = cv2.bitwise_or(cv2.inRange(hsv, np.array(RED_RANGE_1[0]), np.array(RED_RANGE_1[1])),
+                                  cv2.inRange(hsv, np.array(RED_RANGE_2[0]), np.array(RED_RANGE_2[1])))
+        yellow_mask = cv2.inRange(hsv, np.array(YELLOW_RANGE[0]), np.array(YELLOW_RANGE[1]))
+        green_mask = cv2.inRange(hsv, np.array(GREEN_RANGE[0]), np.array(GREEN_RANGE[1]))
+
+        counts = {'RED': np.sum(red_mask>0), 'YELLOW': np.sum(yellow_mask>0), 'GREEN': np.sum(green_mask>0)}
+        if max(counts.values()) < 50:
+            return TrafficLightState.UNKNOWN
+        return TrafficLightState(max(counts, key=counts.get))
+
+    def analyze_traffic_lights(self, frame, detections):
+        lights = []
+        for bbox, cls_name, conf in detections:
+            if cls_name in TRAFFIC_LIGHT_CLASSES:
+                x1, y1, x2, y2 = map(int, bbox)
+                roi = frame[y1:y2, x1:x2]
+                state = self.detect_light_color(roi)
+                lights.append({'bbox':(x1,y1,x2,y2),'state':state,'confidence':conf,'class':cls_name})
+        return lights
+
+    def get_dominant_state(self, lights):
+        if not lights: return TrafficLightState.UNKNOWN
+        states = [l['state'] for l in lights]
+        if TrafficLightState.RED in states: return TrafficLightState.RED
+        if TrafficLightState.YELLOW in states: return TrafficLightState.YELLOW
+        if TrafficLightState.GREEN in states: return TrafficLightState.GREEN
+        return TrafficLightState.UNKNOWN
+
+    def update_history(self, state):
+        self.light_history.append(state)
+
+    def get_stable_state(self):
+        if not self.light_history: return TrafficLightState.UNKNOWN
+        counts = {}
+        for s in self.light_history: counts[s]=counts.get(s,0)+1
+        return max(counts,key=counts.get)
+
 
 # -------------------------------
 # Crosswalk Stripe Detector
